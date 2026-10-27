@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codex Auto Resume 控制台</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="dot" id="daemon-dot"></span>
+    <h1>Codex Auto Resume</h1>
+    <span class="badge" id="daemon-badge">加载中</span>
+    <span class="badge" id="mode-badge">—</span>
+  </div>
+  <div class="actions">
+    <span class="muted" id="updated">—</span>
+    <label class="switch"><input type="checkbox" id="auto" checked> 自动刷新</label>
+    <button id="refresh" class="btn">刷新</button>
+  </div>
+</header>
+
+<main>
+  <section class="grid">
+    <article class="card">
+      <h2>额度</h2>
+      <div id="quota-body"><p class="muted">加载中…</p></div>
+      <div class="row-end"><button class="btn ghost" id="quota-refresh">实时刷新</button></div>
+    </article>
+
+    <article class="card">
+      <h2>最近扫描</h2>
+      <div class="metrics" id="scan-metrics"></div>
+    </article>
+
+    <article class="card">
+      <h2>待续跑</h2>
+      <div id="waiting-body"></div>
+    </article>
+
+    <article class="card">
+      <h2>提交统计</h2>
+      <div class="metrics" id="attempt-metrics"></div>
+    </article>
+  </section>
+
+  <section class="card">
+    <h2>候选会话 <span class="muted" id="candidates-count"></span></h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>会话</th><th>项目</th><th>目录</th><th>状态</th><th>失败 Turn</th></tr></thead>
+        <tbody id="candidates-body"></tbody>
+      </table>
+    </div>
+    <p class="muted" id="candidates-empty">没有等待续跑的候选会话。</p>
+  </section>
+
+  <section class="card">
+    <details>
+      <summary>未监控的候选 <span class="muted" id="unmonitored-count"></span></summary>
+      <p class="muted">这些会话同样因额度中断，但 cwd 不在已启用的监控项目内，不会被自动续跑。</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>会话</th><th>目录</th><th>状态</th><th>失败 Turn</th></tr></thead>
+          <tbody id="unmonitored-body"></tbody>
+        </table>
+      </div>
+    </details>
+  </section>
+
+  <section class="card">
+    <h2>监控项目</h2>
+    <p class="muted">未添加任何项目 = 监控全部 thread。添加后只续跑 cwd 位于这些目录（含子目录）的会话；禁用则临时跳过。</p>
+    <div id="projects" class="projects"></div>
+    <form id="add-form" class="add-form">
+      <input id="new-path" placeholder="/home/user/gitee/project（绝对路径）" autocomplete="off">
+      <input id="new-label" placeholder="备注（可选）" autocomplete="off">
+      <button class="btn" type="submit">添加</button>
+    </form>
+    <p class="error" id="config-error"></p>
+  </section>
+
+  <section class="card">
+    <h2>提交记录 <span class="muted" id="attempts-count"></span></h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>时间</th><th>会话</th><th>状态</th><th>新 Turn</th><th>详情</th></tr></thead>
+        <tbody id="attempts-body"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<div id="toast" class="toast" hidden></div>
+<script src="/app.js"></script>
+</body>
+</html>
