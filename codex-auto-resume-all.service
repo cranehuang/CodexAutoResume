@@ -1,0 +1,14 @@
+[Unit]
+Description=Codex dynamic all-thread usage-limit recovery (existing App Server)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/codex-auto-resume
+ExecStart=/usr/bin/python3 %h/.local/share/codex-auto-resume/guardian.py --daemon --interval 120 --send
+Restart=always
+RestartSec=30
+UMask=0077
+
+[Install]
+WantedBy=default.target
