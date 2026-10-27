@@ -49,6 +49,16 @@ function fmtTime(iso) {
   return d.toLocaleString('zh-CN', { hour12: false });
 }
 
+function fmtReset(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return String(iso);
+  const now = new Date();
+  const time = d.toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit' });
+  if (d.toDateString() === now.toDateString()) return time;
+  return `${d.getMonth() + 1}月${d.getDate()}日 ${time}`;
+}
+
 function fmtAge(seconds) {
   if (seconds === null || seconds === undefined) return '—';
   if (seconds < 60) return `${seconds} 秒`;
@@ -181,6 +191,20 @@ function renderAttemptStats() {
   ]);
 }
 
+function windowLabel(name, window_) {
+  const mins = window_ && window_.windowDurationMins;
+  if (typeof mins === 'number' && mins > 0) {
+    if (mins >= 525600) return '每年额度';
+    if (mins >= 43200) return '每月额度';
+    if (mins >= 10080) return '每周额度';
+    if (mins >= 1440) return '每天额度';
+    if (mins >= 300) return '5 小时额度';
+    if (mins % 60 === 0) return `${mins / 60} 小时额度`;
+    return `${mins} 分钟额度`;
+  }
+  return name === 'primary' ? '短周期额度' : '长周期额度';
+}
+
 function currentQuota() {
   const snapshot = (overview && overview.status && overview.status.quota) || null;
   if (liveQuota && (liveQuota.primary || liveQuota.secondary)) {
@@ -201,7 +225,7 @@ function renderQuota() {
   }
 
   const line = make('div', null, 'quota-line');
-  line.append(make('span', 'ordinaryUsageAllowed', 'muted'),
+  line.append(make('span', '额度状态', 'muted'),
               make('span', quota.ordinaryUsageAllowed ? '可用' : '受限',
                    'badge ' + (quota.ordinaryUsageAllowed ? 'ok' : 'bad')));
   box.append(line);
@@ -210,16 +234,18 @@ function renderQuota() {
     const window_ = quota[name];
     if (!window_) continue;
     const used = pct(window_.usedPercent);
+    const remaining = used == null ? null : Math.max(0, Math.min(100, Math.round(100 - used)));
     const head = make('div', null, 'quota-head');
-    head.append(make('span', name), make('span', used == null ? '—' : `${used}%`));
+    head.append(make('span', windowLabel(name, window_)),
+                make('span', remaining == null ? '—' : `剩余 ${remaining}%`));
     const bar = make('div', null, 'bar');
     const fill = make('i');
-    if (used != null) {
-      fill.style.width = `${used}%`;
-      fill.className = used >= 90 ? 'bad' : used >= 60 ? 'warn' : '';
+    if (remaining != null) {
+      fill.style.width = `${remaining}%`;
+      fill.className = remaining <= 15 ? 'bad' : remaining <= 50 ? 'warn' : '';
     }
     bar.append(fill);
-    const reset = window_.resetsAt ? `重置 ${fmtTime(window_.resetsAt)}` : '';
+    const reset = window_.resetsAt ? `重置 ${fmtReset(window_.resetsAt)}` : '';
     const block = make('div', null, 'quota-window');
     block.append(head, bar);
     if (reset) block.append(make('div', reset, 'quota-reset'));

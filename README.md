@@ -90,7 +90,7 @@ ssh -L 8787:127.0.0.1:8787 huangrenhe@<server>
 页面提供：
 
 - 守护进程状态、SEND / DRY-RUN 模式、最近扫描时间与扫描间隔
-- 额度：primary / secondary 使用率、重置时间、`ordinaryUsageAllowed`；支持实时探测（默认缓存 10s）
+- 额度：5 小时 / 每周窗口的剩余比例与重置时间（与 Codex `/status` 一致）、额度状态；支持实时探测（默认缓存 10s）
 - 扫描指标：thread 总数、候选、未监控、去重、错误、本轮耗时
 - 候选会话与未监控会话明细（thread、cwd、失败 turn）
 - 提交记录（`attempts` 表，含 `unknown`）
