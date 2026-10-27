@@ -8,16 +8,18 @@
 - 对同一 (Thread ID, failed Turn ID) 使用 SQLite 去重，发送之前记录 claim，结果不确定时标记 `unknown`，不会盲目重发。之后如果又出现新额度失败 Turn，视为新恢复事件。
 - 在发送前重新确认目标状态和最新 Turn，避免人工已经续跑后重复发送。
 - 原会话 `notLoaded` 时使用 `thread/resume` 加载该 Thread；不 fork，不更换 Thread ID。
-- 默认**仅 dry-run**，加 `--send` 才会真的发送。提供 systemd user unit 模板和一个只读监控 + 项目白名单的 Web 控制台（`web.py`）。
+- 默认**仅 dry-run**，加 `--send` 才会真的发送。提供 systemd user unit（Linux）/ launchd LaunchAgent（macOS）和一个只读监控 + 项目白名单的 Web 控制台（`web.py`）。
 
 ## 安装
 
-代码仓库可以放在任意位置；`install.sh` 会把脚本复制到固定目录 `~/.local/share/codex-auto-resume/`，systemd unit 只引用该目录，因此移动/重命名仓库不需要改 unit。
+代码仓库可以放在任意位置；`install.sh` 会把脚本复制到固定目录 `~/.local/share/codex-auto-resume/`，服务定义只引用该目录，因此移动/重命名仓库不需要改服务定义。
+
+`install.sh` 会自动识别平台：Linux 装 systemd user unit，macOS 装 launchd LaunchAgent。
 
 先手动验证（可选）：
 
 ```bash
-python3 -m py_compile guardian.py probe_transport.py web.py
+python3 -m py_compile guardian.py probe_transport.py web.py install_macos.py
 python3 guardian.py         # 首次只读扫描，包括历史失败线程
 python3 guardian.py --status
 python3 guardian.py --send  # 警告：会真实向所有符合条件的原会话发送“继续”
@@ -27,22 +29,60 @@ python3 guardian.py --send  # 警告：会真实向所有符合条件的原会�
 
 ```bash
 ./install.sh
+# Linux
 journalctl --user -u codex-auto-resume-all.service -f
+# macOS
+tail -f ~/Library/Logs/codex-auto-resume/guardian.log
 ```
 
-`install.sh` 会复制脚本、`webui/` 和两个 unit，`daemon-reload`、`enable` 并重启服务。之后更新代码只需重新执行 `./install.sh`。
+`install.sh` 会复制脚本、`webui/` 和平台对应的服务定义，并立即启用、重启服务。之后更新代码只需重新执行 `./install.sh`。
 
 - 安装目录：`~/.local/share/codex-auto-resume/`（可用 `CODEX_GUARDIAN_INSTALL_DIR` 覆盖）
 - 状态库：`~/.local/state/codex-auto-resume-all/attempts.sqlite3`（不随仓库或安装目录变化）
 - 配置文件：`~/.local/state/codex-auto-resume-all/config.json`（Web 控制台写入）
 
-## Web 控制台
+### macOS（launchd）
 
-`install.sh` 会同时安装 `codex-auto-resume-web.service`，默认只监听 `127.0.0.1:8787`：
+`install.sh` 在 Darwin 上调用 `install_macos.py`，生成并加载两个 LaunchAgent：
+
+| Label | 作用 | 日志 |
+| --- | --- | --- |
+| `com.codex-auto-resume.guardian` | `guardian.py --daemon --interval 120 --send` | `~/Library/Logs/codex-auto-resume/guardian.log` |
+| `com.codex-auto-resume.web` | `web.py --host 127.0.0.1 --port 8787` | `~/Library/Logs/codex-auto-resume/web.log` |
 
 ```bash
+ls ~/Library/LaunchAgents/com.codex-auto-resume.*.plist
+launchctl print gui/$(id -u)/com.codex-auto-resume.guardian | head -20
+launchctl kickstart -k gui/$(id -u)/com.codex-auto-resume.guardian   # 重启守护器
+launchctl kickstart -k gui/$(id -u)/com.codex-auto-resume.web        # 重启控制台
+```
+
+- launchd **不会展开 `~` 或读取登录 shell 的 `PATH`**，所以 plist 里写入的是绝对路径。解释器默认取执行 `install.sh` 时 `PATH` 里的 `python3`（Homebrew 的稳定符号链接，而非带版本号的 Cellar 路径）；需要指定时用 `CODEX_GUARDIAN_PYTHON=/path/to/python3 ./install.sh`。
+- 如果设置了自定义 `CODEX_HOME`，安装时会写入 plist 的 `EnvironmentVariables`，保证守护器连到同一个 App Server socket。
+- 只写 plist 不加载（排查用）：`python3 install_macos.py --install-dir ~/.local/share/codex-auto-resume --no-load`。
+- 需要用户已登录图形会话（LaunchAgent 属于 `gui/<uid>`）；纯 SSH 且无登录会话时 `launchctl` 可能报 domain 不存在。
+- 卸载：
+
+  ```bash
+  launchctl bootout gui/$(id -u)/com.codex-auto-resume.guardian
+  launchctl bootout gui/$(id -u)/com.codex-auto-resume.web
+  rm -f ~/Library/LaunchAgents/com.codex-auto-resume.*.plist
+  rm -rf ~/.local/share/codex-auto-resume
+  # 状态目录 ~/.local/state/codex-auto-resume-all 默认保留，确认不再需要再手动删除
+  ```
+
+
+## Web 控制台
+
+`install.sh` 会同时安装 `codex-auto-resume-web.service`（Linux）/ `com.codex-auto-resume.web`（macOS），默认只监听 `127.0.0.1:8787`：
+
+```bash
+# Linux
 systemctl --user status codex-auto-resume-web.service
 journalctl --user -u codex-auto-resume-web.service -f
+# macOS
+launchctl print gui/$(id -u)/com.codex-auto-resume.web | head -20
+tail -f ~/Library/Logs/codex-auto-resume/web.log
 # 在本地机器建立隧道，然后浏览器打开 http://127.0.0.1:8787/
 ssh -L 8787:127.0.0.1:8787 huangrenhe@<server>
 ```
@@ -62,7 +102,7 @@ ssh -L 8787:127.0.0.1:8787 huangrenhe@<server>
 
 只读 API：`/api/overview`、`/api/config`、`/api/attempts`、`/api/quota`；修改配置用 `PUT /api/config`（要求 `Content-Type: application/json`）。
 
-若需要退出 SSH 后仍然运行，管理员可执行 `sudo loginctl enable-linger huangrenhe`。
+若需要退出 SSH 后仍然运行：Linux 管理员可执行 `sudo loginctl enable-linger huangrenhe`；macOS 的 LaunchAgent 属于 `gui/<uid>`，需要保持用户登录图形会话（可用自动登录）。
 
 ## 安全约束
 
@@ -73,3 +113,4 @@ ssh -L 8787:127.0.0.1:8787 huangrenhe@<server>
 5. Mac 离线后能否持续运行依赖既有 App Server 的生命周期。如果服务器上的 Socket 消失，守护器会记录错误并在下一周期重连，**不会擅自重启/更换**原 App Server。
 6. 如果 Codex 版本升级导致 `thread/turns/list` 分页出现历史不一致，本守护器可能漏检或误判；务必在实际环境做小规模验收后再用于重要项目。
 7. Web 控制台默认只监听 `127.0.0.1` 且没有鉴权。能访问它就能修改监控项目，因此不要改绑 `0.0.0.0` 或直接暴露到公网，推荐 SSH 端口转发。
+8. macOS 的 Unix socket 路径上限是 104 字节（Linux 108）。`CODEX_HOME` 太深会让 `app-server-control.sock` 超长，`probe_transport.py` 会直接报错而不是截断路径；把 `CODEX_HOME` 换到更短的目录即可。

@@ -5,18 +5,20 @@ Guardian：通过已有的 Codex App Server Unix socket 扫描历史 thread，�
 ## 常用命令
 
 ```bash
-python3 -m unittest test_guardian test_web -v   # 全部测试（不需要真实 socket / Codex）
+python3 -m unittest test_guardian test_web test_macos -v   # 全部测试（不需要真实 socket / Codex）
 python3 -m unittest test_guardian.GuardianTests.test_not_loaded_resumed_original_id
-python3 -m py_compile guardian.py web.py probe_transport.py
+python3 -m py_compile guardian.py web.py probe_transport.py install_macos.py
+bash -n install.sh
 python3 guardian.py                      # dry-run 单次全量扫描（默认，不发送）
 python3 guardian.py --status             # 查看本地 attempts 记录，不抢锁
 python3 web.py --no-live                 # 本地起控制台（127.0.0.1:8787）
-./install.sh                             # 安装/更新到固定目录并重启两个 user 服务
+./install.sh                             # 安装/更新到固定目录，按平台重启服务
 ```
 
 - 改完代码必须重跑 `./install.sh`：服务跑的是 `~/.local/share/codex-auto-resume/` 里的副本（含 `webui/`），不是仓库里的文件。
-- 服务：`codex-auto-resume-all.service`（守护，`--daemon --interval 120 --send`）和 `codex-auto-resume-web.service`（控制台，127.0.0.1:8787）。日志用 `journalctl --user -u <unit> -f`。
-- 不要在 unit 里改成仓库路径——历史上仓库移动导致 `CHDIR` 反复失败；unit 只引用固定安装目录。
+- Linux 服务：`codex-auto-resume-all.service`（守护，`--daemon --interval 120 --send`）和 `codex-auto-resume-web.service`（控制台，127.0.0.1:8787）。日志用 `journalctl --user -u <unit> -f`。
+- macOS 服务：`install.sh` 调用 `install_macos.py` 生成 `~/Library/LaunchAgents/com.codex-auto-resume.{guardian,web}.plist` 并 `launchctl bootout/bootstrap`。launchd 不展开 `~`、不继承登录 shell 的 `PATH`，所以 plist 必须写绝对路径（脚本在安装时生成，别手写模板）。日志在 `~/Library/Logs/codex-auto-resume/*.log`。
+- 不要在 unit/plist 里改成仓库路径——历史上仓库移动导致 `CHDIR` 反复失败；服务定义只引用固定安装目录。
 
 ## 改动前必读的约束
 
@@ -43,6 +45,14 @@ python3 web.py --no-live                 # 本地起控制台（127.0.0.1:8787�
 - `test_guardian.py` 用 `FakeServer`，完全离线，不需要 App Server。
 - `FakeServer.call()` 按方法名硬编码。新增/修改 RPC 调用时要在 `FakeServer` 里同步实现，否则测试抛 `Unexpected method`。
 - 测试会断言 `starts` 次数和 attempts 表行数，改判定/去重逻辑时优先扩展这些用例。
+- `test_macos.py` 只验证 plist 生成（`plistlib` 解析、绝对路径、参数、Umask），**不调用 `launchctl`**，所以在 Linux 上也能跑。不要去真实 `bootout` 别人的 LaunchAgent。
+
+## macOS 支持
+
+- 运行时逻辑（`guardian.py`/`web.py`/`probe_transport.py`）保持跨平台、纯 stdlib；平台差异只放在 `install.sh` 和 `install_macos.py`。
+- plist 在安装时生成而不是仓库里放模板：launchd 不展开 `~`/环境变量，也不继承登录 shell 的 `PATH`，写死 `python3` 的绝对路径才能可靠启动。解释器默认为 PATH 中的 `python3`，可用 `CODEX_GUARDIAN_PYTHON` 覆盖。
+- 守护器和控制台都用 `KeepAlive=true` 模拟 `Restart=always`；`ThrottleInterval` 分别 30s / 10s。
+- 日志走 `StandardOutPath`/`StandardErrorPath`（`~/Library/Logs/codex-auto-resume/`），没有 journald。
 
 ## 仓库与提交
 

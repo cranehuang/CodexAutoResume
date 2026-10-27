@@ -20,8 +20,17 @@ from pathlib import Path
 
 GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 
+def check_socket_path(path):
+    """macOS caps sun_path at 104 bytes (Linux 108); fail with a readable error."""
+    limit = 104 if sys.platform == 'darwin' else 108
+    size = len(os.fsencode(path))
+    if size >= limit:
+        raise RuntimeError(f'Unix socket path is too long for this platform '
+                           f'({size} >= {limit} bytes): {path}')
+
 class Client:
     def __init__(self, path, timeout=7):
+        check_socket_path(path)
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.settimeout(timeout)
         self.sock.connect(path)
