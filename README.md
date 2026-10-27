@@ -1,31 +1,111 @@
-# Codex SSH 原会话动态额度续跑 Guardian v1（实验版）
+# Codex Auto-Resume Guardian v1 (experimental)
 
-适配用户现有的 Codex CLI `0.161.0` / `~/.codex/app-server-control/app-server-control.sock`。不新建 Codex App Server，不固定 Thread ID。
+English | [简体中文](README.zh-CN.md)
 
-- **首次启动：全量遍历 `thread/list` 的所有分页**，纳入之前已发生的额度中断；以后每次扫描也做相同判断。
-- 只检测 **最新 Turn 为 `failed` 且 `error.codexErrorInfo == 'usageLimitExceeded'`** 的会话。
-- `ordinaryUsageAllowed is True` 才发送；其他值全部等待。额度可用后默认恢复所有满足条件的会话，不做单会话上限。
-- 对同一 (Thread ID, failed Turn ID) 使用 SQLite 去重，发送之前记录 claim，结果不确定时标记 `unknown`，不会盲目重发。之后如果又出现新额度失败 Turn，视为新恢复事件。
-- 在发送前重新确认目标状态和最新 Turn，避免人工已经续跑后重复发送。
-- 原会话 `notLoaded` 时使用 `thread/resume` 加载该 Thread；不 fork，不更换 Thread ID。
-- 默认**仅 dry-run**，加 `--send` 才会真的发送。提供 systemd user unit（Linux）/ launchd LaunchAgent（macOS）和一个只读监控 + 项目白名单的 Web 控制台（`web.py`）。
+Automatically resumes the **original** Codex threads that stopped because the account hit
+its usage limit, as soon as quota is available again.
 
-## 安装
+It works against an existing Codex CLI `0.161.0` App Server
+(`~/.codex/app-server-control/app-server-control.sock`). It never starts a second App
+Server and never forks or re-keys a thread: the continuation is sent to the same thread ID.
 
-代码仓库可以放在任意位置；`install.sh` 会把脚本复制到固定目录 `~/.local/share/codex-auto-resume/`，服务定义只引用该目录，因此移动/重命名仓库不需要改服务定义。
+- **Every scan walks all `thread/list` pages**, so quota failures that happened before the
+  first boot are picked up too.
+- Only threads whose **latest turn is `failed`** with
+  `error.codexErrorInfo == 'usageLimitExceeded'` are considered.
+- Sending requires `ordinaryUsageAllowed is True`; any other value waits. When quota is
+  back, every eligible thread is resumed by default — there is no per-thread cap.
+- SQLite deduplicates by `(thread ID, failed turn ID)`. The claim row is written **before**
+  `turn/start`; ambiguous results are recorded as `unknown` and never re-sent. A later,
+  different failed turn counts as a new recovery event.
+- Thread status and latest turn are re-checked right before sending, so a manual resume is
+  not duplicated.
+- `notLoaded` threads are loaded with `thread/resume`; no fork, no new thread ID.
+- **Dry-run by default** — only `--send` actually writes. Ships with systemd user units
+  (Linux) / launchd LaunchAgents (macOS) and a local web console (`web.py`) for metrics,
+  live quota and a project allow-list.
 
-`install.sh` 会自动识别平台：Linux 装 systemd user unit，macOS 装 launchd LaunchAgent。
+No third-party dependencies: runtime and web console are pure Python standard library.
 
-先手动验证（可选）：
+## Architecture
+
+```mermaid
+flowchart LR
+  Browser["Browser / SSH tunnel"] --> UI
+
+  subgraph CodexSide["Codex (existing process)"]
+    AS["App Server<br/>Unix socket"]
+  end
+
+  subgraph GuardianSide["guardian.py --daemon --send"]
+    SCAN["Scan all pages<br/>thread/list"]
+    CHECK{"Latest turn failed with<br/>usageLimitExceeded?"}
+    QUOTA{"ordinaryUsageAllowed?"}
+    CLAIM["claim()<br/>before sending"]
+    RESUME["thread/resume if notLoaded<br/>turn/start '继续'"]
+  end
+
+  subgraph StateSide["state dir<br/>~/.local/state/codex-auto-resume-all"]
+    CFG["config.json"]
+    DB[("attempts.sqlite3")]
+    SNAP["status.json"]
+  end
+
+  subgraph WebSide["web.py :8787"]
+    API["REST API<br/>/api/overview · /api/quota · /api/config"]
+    UI["webui/<br/>vanilla JS, no build step"]
+  end
+
+  CFG -. reread every scan .-> SCAN
+  AS <-->|JSON-RPC<br/>WebSocket| SCAN
+  SCAN --> CHECK
+  CHECK -- no --> SNAP
+  CHECK -- yes --> QUOTA
+  QUOTA -- no / unknown --> SNAP
+  QUOTA -- yes --> CLAIM --> DB
+  CLAIM --> RESUME -->|turn/start| AS
+  RESUME -. state=unknown .-> DB
+  SNAP --> API
+  DB --> API
+  API --> UI
+  API <-->|account/rateLimits/read| AS
+```
+
+Runtime pieces:
+
+| Component | Role |
+| --- | --- |
+| `guardian.py` | Scans threads, checks quota, claims and sends the continuation; writes `status.json` |
+| `probe_transport.py` | Hand-written WebSocket + JSON-RPC client over the Unix socket (RFC 6455 framing, 64 MiB frame cap, linear reassembly) |
+| `web.py` | Stdlib HTTP server: read-only APIs, live quota probe with cache, project allow-list config |
+| `webui/` | Static frontend (`index.html` / `app.js` / `style.css`), served as-is |
+| `install.sh`, `install_macos.py` | Install to a fixed directory and (re)start systemd units / launchd agents |
+| `attempts.sqlite3` | At-most-once ledger (`claimed_at`, `state`, thread/title/cwd/project snapshot) |
+| `status.json` | Last scan snapshot, atomically rewritten each round |
+| `config.json` | Project allow-list, written by the web console and re-read every scan |
+
+Scan flow per round: read `config.json` → walk all thread pages → keep `usageLimitExceeded`
+failures not seen before → read `account/rateLimits/read` → claim each candidate in SQLite
+→ `thread/resume` if needed → `turn/start` with `继续` → record `submitted` / `unknown`.
+
+## Install
+
+The repository can live anywhere. `install.sh` copies the scripts into the fixed directory
+`~/.local/share/codex-auto-resume/`; service definitions only reference that directory, so
+moving or renaming the checkout does not require editing units.
+
+`install.sh` detects the platform: systemd user units on Linux, launchd LaunchAgents on macOS.
+
+Optional manual check first:
 
 ```bash
 python3 -m py_compile guardian.py probe_transport.py web.py install_macos.py
-python3 guardian.py         # 首次只读扫描，包括历史失败线程
+python3 guardian.py         # first read-only scan, including historical failures
 python3 guardian.py --status
-python3 guardian.py --send  # 警告：会真实向所有符合条件的原会话发送“继续”
+python3 guardian.py --send  # WARNING: really sends "继续" to every eligible original thread
 ```
 
-确认无误后安装为常驻服务：
+Install as a resident service once you are happy:
 
 ```bash
 ./install.sh
@@ -35,17 +115,19 @@ journalctl --user -u codex-auto-resume-all.service -f
 tail -f ~/Library/Logs/codex-auto-resume/guardian.log
 ```
 
-`install.sh` 会复制脚本、`webui/` 和平台对应的服务定义，并立即启用、重启服务。之后更新代码只需重新执行 `./install.sh`。
+`install.sh` copies the scripts, `webui/` and the platform service definitions, then
+enables and restarts the services. After changing code, run `./install.sh` again — the
+services run the installed copy, not the checkout.
 
-- 安装目录：`~/.local/share/codex-auto-resume/`（可用 `CODEX_GUARDIAN_INSTALL_DIR` 覆盖）
-- 状态库：`~/.local/state/codex-auto-resume-all/attempts.sqlite3`（不随仓库或安装目录变化）
-- 配置文件：`~/.local/state/codex-auto-resume-all/config.json`（Web 控制台写入）
+- Install dir: `~/.local/share/codex-auto-resume/` (override with `CODEX_GUARDIAN_INSTALL_DIR`)
+- State DB: `~/.local/state/codex-auto-resume-all/attempts.sqlite3` (independent of the repo/install dir)
+- Config: `~/.local/state/codex-auto-resume-all/config.json` (written by the web console)
 
-### macOS（launchd）
+### macOS (launchd)
 
-`install.sh` 在 Darwin 上调用 `install_macos.py`，生成并加载两个 LaunchAgent：
+On Darwin, `install.sh` calls `install_macos.py`, which generates and loads two LaunchAgents:
 
-| Label | 作用 | 日志 |
+| Label | Command | Log |
 | --- | --- | --- |
 | `com.codex-auto-resume.guardian` | `guardian.py --daemon --interval 120 --send` | `~/Library/Logs/codex-auto-resume/guardian.log` |
 | `com.codex-auto-resume.web` | `web.py --host 127.0.0.1 --port 8787` | `~/Library/Logs/codex-auto-resume/web.log` |
@@ -53,28 +135,33 @@ tail -f ~/Library/Logs/codex-auto-resume/guardian.log
 ```bash
 ls ~/Library/LaunchAgents/com.codex-auto-resume.*.plist
 launchctl print gui/$(id -u)/com.codex-auto-resume.guardian | head -20
-launchctl kickstart -k gui/$(id -u)/com.codex-auto-resume.guardian   # 重启守护器
-launchctl kickstart -k gui/$(id -u)/com.codex-auto-resume.web        # 重启控制台
+launchctl kickstart -k gui/$(id -u)/com.codex-auto-resume.guardian   # restart guardian
+launchctl kickstart -k gui/$(id -u)/com.codex-auto-resume.web        # restart console
 ```
 
-- launchd **不会展开 `~` 或读取登录 shell 的 `PATH`**，所以 plist 里写入的是绝对路径。解释器默认取执行 `install.sh` 时 `PATH` 里的 `python3`（Homebrew 的稳定符号链接，而非带版本号的 Cellar 路径）；需要指定时用 `CODEX_GUARDIAN_PYTHON=/path/to/python3 ./install.sh`。
-- 如果设置了自定义 `CODEX_HOME`，安装时会写入 plist 的 `EnvironmentVariables`，保证守护器连到同一个 App Server socket。
-- 只写 plist 不加载（排查用）：`python3 install_macos.py --install-dir ~/.local/share/codex-auto-resume --no-load`。
-- 需要用户已登录图形会话（LaunchAgent 属于 `gui/<uid>`）；纯 SSH 且无登录会话时 `launchctl` 可能报 domain 不存在。
-- 卸载：
+- launchd **does not expand `~` and does not inherit the login shell's `PATH`**, so the
+  plists contain absolute paths. The interpreter defaults to the `python3` found on `PATH`
+  when `install.sh` runs (Homebrew's stable symlink, not a versioned Cellar path); override
+  with `CODEX_GUARDIAN_PYTHON=/path/to/python3 ./install.sh`.
+- If you use a custom `CODEX_HOME`, it is written into the plist `EnvironmentVariables` so
+  the guardian connects to the same App Server socket.
+- Write plists without loading (troubleshooting): `python3 install_macos.py --install-dir ~/.local/share/codex-auto-resume --no-load`.
+- A graphical login session is required (LaunchAgents belong to `gui/<uid>`); over plain
+  SSH without a login session, `launchctl` may report that the domain does not exist.
+- Uninstall:
 
   ```bash
   launchctl bootout gui/$(id -u)/com.codex-auto-resume.guardian
   launchctl bootout gui/$(id -u)/com.codex-auto-resume.web
   rm -f ~/Library/LaunchAgents/com.codex-auto-resume.*.plist
   rm -rf ~/.local/share/codex-auto-resume
-  # 状态目录 ~/.local/state/codex-auto-resume-all 默认保留，确认不再需要再手动删除
+  # state dir ~/.local/state/codex-auto-resume-all is kept by default
   ```
 
+## Web console
 
-## Web 控制台
-
-`install.sh` 会同时安装 `codex-auto-resume-web.service`（Linux）/ `com.codex-auto-resume.web`（macOS），默认只监听 `127.0.0.1:8787`：
+`install.sh` also installs `codex-auto-resume-web.service` (Linux) /
+`com.codex-auto-resume.web` (macOS). It listens on `127.0.0.1:8787` only:
 
 ```bash
 # Linux
@@ -83,34 +170,69 @@ journalctl --user -u codex-auto-resume-web.service -f
 # macOS
 launchctl print gui/$(id -u)/com.codex-auto-resume.web | head -20
 tail -f ~/Library/Logs/codex-auto-resume/web.log
-# 在本地机器建立隧道，然后浏览器打开 http://127.0.0.1:8787/
+# tunnel from your laptop, then open http://127.0.0.1:8787/
 ssh -L 8787:127.0.0.1:8787 huangrenhe@<server>
 ```
 
-页面提供：
+The page shows:
 
-- 守护进程状态、SEND / DRY-RUN 模式、最近扫描时间与扫描间隔
-- 额度：5 小时 / 每周窗口的剩余比例与重置时间（与 Codex `/status` 一致）、额度状态；支持实时探测（默认缓存 10s）
-- 扫描指标：thread 总数、候选、未监控、去重、错误、本轮耗时
-- 候选会话与未监控会话明细（thread、cwd、失败 turn）
-- 提交记录（`attempts` 表，含 `unknown`）
-- **监控项目配置**（右上角 ⚙ 配置菜单）：添加/删除项目、启用/停用。守护器每轮扫描重新读取，保存后无需重启
+- daemon status, SEND / DRY-RUN mode, last scan time and interval
+- quota: **remaining** percentage and reset time for the 5-hour / weekly windows (same
+  framing as Codex `/status`), plus the quota state; live probe cached for 10s by default
+- scan metrics: threads, candidates, unmonitored, duplicates, errors, round duration
+- candidate and unmonitored details (thread, cwd, failed turn)
+- submission history (`attempts` table, including `unknown`)
+- **project allow-list** (⚙ menu, top right): add/remove/enable/disable. The guardian
+  re-reads it every scan, so no restart is needed
 
-项目匹配规则：**项目列表为空（或全部停用）= 监控全部 thread**；存在启用项目时，只续跑 `cwd` 等于项目路径或位于其子目录下的会话。
+Matching rule: **empty list (or all disabled) = monitor every thread**; otherwise only
+threads whose `cwd` equals a project path or lives below it are resumed.
 
-本地调试可直接运行：`python3 web.py --state-dir ~/.local/state/codex-auto-resume-all --no-live`。
+Local debugging: `python3 web.py --state-dir ~/.local/state/codex-auto-resume-all --no-live`.
 
-只读 API：`/api/overview`、`/api/config`、`/api/attempts`、`/api/quota`；修改配置用 `PUT /api/config`（要求 `Content-Type: application/json`）。
+Read-only APIs: `/api/overview`, `/api/config`, `/api/attempts`, `/api/quota`; config
+updates use `PUT /api/config` (requires `Content-Type: application/json`).
 
-若需要退出 SSH 后仍然运行：Linux 管理员可执行 `sudo loginctl enable-linger huangrenhe`；macOS 的 LaunchAgent 属于 `gui/<uid>`，需要保持用户登录图形会话（可用自动登录）。
+To keep it running after logging out of SSH: Linux admins can run
+`sudo loginctl enable-linger huangrenhe`; macOS LaunchAgents belong to `gui/<uid>` and need
+a logged-in graphical session (automatic login works).
 
-## 安全约束
+## Safety constraints
 
-1. `--send` 是真实执行请求，可能引发代码修改、消耗额度和测试命令，建议先用测试仓库和 dry-run 验证。
-2. 原始 Thread 可能包含需人工审批或生产操作；守护器不自动批准审批请求。尽管如此，恢复后的 Codex 仍会在原沙箱和批准策略下运行，因此需保持既有权限最小化。
-3. 默认全部续跑意味着多个会话可能同时编辑**同一仓库目录**，造成代码冲突；建议你采用不同 Git worktree 保护并行任务。此版本不自动创建 worktree，也不限制同目录并发。
-4. HTTP/WebSocket/JSON-RPC 无法保证 exactly-once；本守护器提供**最多一次自动提交尝试**，不确定请求不重发。`unknown` 需要人工审查后处理。
-5. Mac 离线后能否持续运行依赖既有 App Server 的生命周期。如果服务器上的 Socket 消失，守护器会记录错误并在下一周期重连，**不会擅自重启/更换**原 App Server。
-6. 如果 Codex 版本升级导致 `thread/turns/list` 分页出现历史不一致，本守护器可能漏检或误判；务必在实际环境做小规模验收后再用于重要项目。
-7. Web 控制台默认只监听 `127.0.0.1` 且没有鉴权。能访问它就能修改监控项目，因此不要改绑 `0.0.0.0` 或直接暴露到公网，推荐 SSH 端口转发。
-8. macOS 的 Unix socket 路径上限是 104 字节（Linux 108）。`CODEX_HOME` 太深会让 `app-server-control.sock` 超长，`probe_transport.py` 会直接报错而不是截断路径；把 `CODEX_HOME` 换到更短的目录即可。
+1. `--send` performs real requests: it can modify code, consume quota and run tests. Always
+   validate in a scratch repository with dry-run first.
+2. Original threads may contain operations that need human approval or touch production. The
+   guardian never approves anything; resumed Codex still runs under the existing sandbox and
+   approval policy, so keep permissions minimal.
+3. Resuming everything by default means multiple sessions may edit **the same repository
+   directory** concurrently and conflict. Use separate Git worktrees for parallel tasks. This
+   version does not create worktrees and does not limit concurrency per directory.
+4. HTTP/WebSocket/JSON-RPC cannot guarantee exactly-once delivery. The guardian provides
+   **at most one automatic attempt** and never re-sends an ambiguous request. `unknown`
+   entries need manual review.
+5. Persistence after the Mac goes offline depends on the existing App Server's lifetime. If
+   the socket disappears, the guardian logs the error and reconnects next cycle; it never
+   restarts or replaces the App Server on its own.
+6. If a Codex upgrade changes `thread/turns/list` pagination semantics, the guardian may miss
+   or misjudge threads. Validate on a small scale before using it on important projects.
+7. The web console binds `127.0.0.1` and has **no authentication**. Anyone who can reach it
+   can edit the allow-list, so do not bind `0.0.0.0` or expose it publicly. Prefer SSH
+   port forwarding.
+8. macOS Unix socket paths are limited to 104 bytes (Linux: 108). A deep `CODEX_HOME` makes
+   `app-server-control.sock` too long; `probe_transport.py` reports an error instead of
+   truncating the path. Point `CODEX_HOME` at a shorter directory.
+
+## Tests
+
+```bash
+python3 -m unittest test_guardian test_web test_transport test_macos -v
+```
+
+All tests are offline: `test_guardian.py` uses a `FakeServer`, `test_web.py` starts a real
+HTTP server on `127.0.0.1:0` with a temporary state dir (live probe disabled),
+`test_transport.py` uses a fake socket, and `test_macos.py` only inspects generated plists
+without calling `launchctl`.
+
+## License
+
+[MIT](LICENSE)
