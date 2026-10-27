@@ -18,6 +18,22 @@
     <span class="muted" id="updated">—</span>
     <label class="switch"><input type="checkbox" id="auto" checked> 自动刷新</label>
     <button id="refresh" class="btn">刷新</button>
+    <div class="menu">
+      <button id="config-toggle" class="btn ghost" aria-expanded="false" aria-controls="config-panel">
+        ⚙ 配置<span class="badge" id="config-count" hidden></span>
+      </button>
+      <section class="card menu-panel" id="config-panel" hidden>
+        <h2>监控项目</h2>
+        <p class="muted small">未添加任何项目 = 监控全部 thread。添加后只续跑 cwd 位于这些目录（含子目录）的会话；禁用则临时跳过。</p>
+        <div id="projects" class="projects"></div>
+        <form id="add-form" class="add-form">
+          <input id="new-path" placeholder="/home/user/gitee/project（绝对路径）" autocomplete="off">
+          <input id="new-label" placeholder="备注（可选）" autocomplete="off">
+          <button class="btn" type="submit">添加</button>
+        </form>
+        <p class="error" id="config-error"></p>
+      </section>
+    </div>
   </div>
 </header>
 
@@ -70,22 +86,10 @@
   </section>
 
   <section class="card">
-    <h2>监控项目</h2>
-    <p class="muted">未添加任何项目 = 监控全部 thread。添加后只续跑 cwd 位于这些目录（含子目录）的会话；禁用则临时跳过。</p>
-    <div id="projects" class="projects"></div>
-    <form id="add-form" class="add-form">
-      <input id="new-path" placeholder="/home/user/gitee/project（绝对路径）" autocomplete="off">
-      <input id="new-label" placeholder="备注（可选）" autocomplete="off">
-      <button class="btn" type="submit">添加</button>
-    </form>
-    <p class="error" id="config-error"></p>
-  </section>
-
-  <section class="card">
     <h2>提交记录 <span class="muted" id="attempts-count"></span></h2>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>时间</th><th>会话</th><th>状态</th><th>新 Turn</th><th>详情</th></tr></thead>
+        <thead><tr><th>时间</th><th>会话</th><th>项目</th><th>目录</th><th>状态</th><th>新 Turn</th><th>详情</th></tr></thead>
         <tbody id="attempts-body"></tbody>
       </table>
     </div>

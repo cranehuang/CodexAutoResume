@@ -89,6 +89,19 @@ input:focus { outline: none; border-color: var(--accent); }
 
 .switch { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px; }
 
+.menu { position: relative; }
+.menu-panel {
+  position: absolute; right: 0; top: calc(100% + 10px);
+  width: min(460px, calc(100vw - 32px));
+  max-height: min(70vh, 520px); overflow-y: auto;
+  z-index: 20; text-align: left;
+  box-shadow: 0 12px 32px rgba(0,0,0,.5);
+}
+.menu-panel .projects { max-height: 220px; overflow-y: auto; margin-top: 10px; }
+.menu-panel[hidden], #config-count[hidden] { display: none; }
+#config-toggle { display: inline-flex; align-items: center; gap: 6px; }
+#config-toggle.active { border-color: var(--accent); color: var(--text); }
+
 .quota-line { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
 .quota-window { margin-bottom: 12px; }
 .quota-head { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 5px; }
@@ -123,6 +136,8 @@ details[open] summary { margin-bottom: 10px; }
 @media (max-width: 700px) {
   .add-form { grid-template-columns: 1fr; }
   .metrics { grid-template-columns: 1fr 1fr; }
+  .menu { position: static; }
+  .menu-panel { left: 10px; right: 10px; width: auto; }
 }
 
 .toast {

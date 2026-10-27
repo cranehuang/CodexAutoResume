@@ -60,6 +60,13 @@ function shortId(id) {
   return id ? String(id).slice(0, 10) : '—';
 }
 
+function baseName(path) {
+  if (!path) return '';
+  const trimmed = String(path).replace(/[\\/]+$/, '');
+  const cut = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'));
+  return cut >= 0 ? trimmed.slice(cut + 1) : trimmed;
+}
+
 function pct(value) {
   return typeof value === 'number' ? Math.max(0, Math.min(100, value)) : null;
 }
@@ -238,7 +245,7 @@ function renderCandidates() {
     whoCell.append(who);
     tr.append(
       whoCell,
-      cell(item.project_label || item.project || '全部', 'small', item.project || ''),
+      cell(item.project_label || baseName(item.project) || '全部', 'small', item.project || ''),
       cell(item.cwd || '—', 'mono small', item.cwd || ''),
       cell(item.status || '—', 'small'),
       cell(shortId(item.failed_turn_id), 'mono small', item.failed_turn_id || ''),
@@ -271,6 +278,11 @@ function renderProjects() {
   const projects = config.projects || [];
   const box = $('projects');
   box.replaceChildren();
+
+  const active = projects.filter((p) => p.enabled !== false).length;
+  const count = $('config-count');
+  count.textContent = projects.length ? `${active}/${projects.length}` : '';
+  count.hidden = !projects.length;
 
   if (!projects.length) {
     box.append(make('p', '当前未限制项目，监控全部 thread。', 'muted'));
@@ -311,15 +323,23 @@ function renderProjects() {
 function renderAttempts() {
   const attempts = (overview && overview.attempts) || { recent: [], total: 0 };
   const rows = attempts.recent || [];
+  const monitorAll = !!(overview && overview.status && overview.status.monitor_all);
   const body = $('attempts-body');
   body.replaceChildren(...rows.map((item) => {
     const tr = document.createElement('tr');
     const [label, kind] = ATTEMPT_STATE[item.state] || [item.state || '—', ''];
     const stateCell = document.createElement('td');
     stateCell.append(make('span', label, 'badge ' + kind));
+    const who = make('div', item.title || shortId(item.thread_id));
+    who.append(make('div', shortId(item.thread_id), 'mono muted'));
+    const whoCell = document.createElement('td');
+    whoCell.append(who);
     tr.append(
       cell(fmtTime(item.claimed_at), 'small'),
-      cell(shortId(item.thread_id), 'mono small', item.thread_id || ''),
+      whoCell,
+      cell(item.project_label || baseName(item.project) || (monitorAll ? '全部' : '—'), 'small',
+           item.project || ''),
+      cell(item.cwd || '—', 'mono small', item.cwd || ''),
       stateCell,
       cell(shortId(item.created_turn_id), 'mono small', item.created_turn_id || ''),
       cell(item.details || '—', 'small', item.details || ''),
@@ -387,6 +407,33 @@ async function saveProjects(projects) {
 }
 
 /* ---------- events ---------- */
+
+function setConfigOpen(open) {
+  const panel = $('config-panel');
+  const toggle = $('config-toggle');
+  panel.hidden = !open;
+  toggle.classList.toggle('active', open);
+  toggle.setAttribute('aria-expanded', String(open));
+  if (open) {
+    const first = $('projects').querySelector('.project-row .path') || $('new-path');
+    if (first) first.focus({ preventScroll: true });
+  }
+}
+
+$('config-toggle').addEventListener('click', (event) => {
+  event.stopPropagation();
+  setConfigOpen($('config-panel').hidden);
+});
+
+document.addEventListener('click', (event) => {
+  if ($('config-panel').hidden) return;
+  if (event.target.closest('#config-panel')) return;
+  setConfigOpen(false);
+});
+
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !$('config-panel').hidden) setConfigOpen(false);
+});
 
 $('refresh').addEventListener('click', () => loadAll({ quota: true }));
 $('quota-refresh').addEventListener('click', () => loadQuota(true));
