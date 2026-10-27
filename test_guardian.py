@@ -1,7 +1,9 @@
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 import guardian
 
 class FakeServer:
@@ -123,6 +125,70 @@ class GuardianTests(unittest.TestCase):
         s = FakeServer([t('b',failed('fb'))])
         guardian.run_scan(s,self.db,True,config=cfg)
         self.assertEqual(s.starts,1)
+
+    def test_attempt_records_thread_title(self):
+        thread = t('a', failed('fa'))
+        thread['name'] = '示例会话'
+        s = FakeServer([thread])
+        cfg = {'projects': [{'path': '/repo/a', 'label': '项目 A', 'enabled': True}]}
+        guardian.run_scan(s, self.db, True, config=cfg)
+        row = self.db.execute('select title, cwd, project, project_label from attempts').fetchone()
+        self.assertEqual(row, ('示例会话', '/repo/a', '/repo/a', '项目 A'))
+
+    def test_backfills_snapshot_fields_of_old_attempts(self):
+        with self.db:
+            self.db.execute("INSERT INTO attempts (thread_id, failed_turn_id, claimed_at, state) "
+                            "VALUES ('a','fa','2024-01-01','submitted')")
+        thread = t('a', failed('fa'))
+        thread['name'] = '补回的标题'
+        cfg = {'projects': [{'path': '/repo/a', 'label': '项目 A', 'enabled': True}]}
+        guardian.run_scan(FakeServer([thread]), self.db, False, config=cfg)
+        row = self.db.execute('select title, cwd, project, project_label from attempts').fetchone()
+        self.assertEqual(row, ('补回的标题', '/repo/a', '/repo/a', '项目 A'))
+
+    def test_infer_project_prefers_git_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'proj'
+            (root / '.git').mkdir(parents=True)
+            nested = root / 'a' / 'b'
+            nested.mkdir(parents=True)
+            self.assertEqual(guardian.infer_project(str(nested)), guardian.norm_path(str(root)))
+            self.assertIsNone(guardian.infer_project(''))
+
+    def test_infer_project_stops_at_home(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(guardian, 'HOME', Path(tmp)):
+                plain = Path(tmp) / 'plain'
+                plain.mkdir()
+                self.assertEqual(guardian.infer_project(str(plain)), guardian.norm_path(str(plain)))
+                gone = str(Path(tmp) / 'gone' / 'proj')
+                self.assertEqual(guardian.infer_project(gone), guardian.norm_path(gone))
+
+    def test_attempt_gets_inferred_project_without_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'proj'
+            (root / '.git').mkdir(parents=True)
+            thread = t('a', failed('fa'))
+            thread['cwd'] = str(root)
+            guardian.run_scan(FakeServer([thread]), self.db, True)
+            self.assertEqual(self.db.execute('select project from attempts').fetchone()[0],
+                             guardian.norm_path(str(root)))
+
+    def test_db_open_adds_title_to_old_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'old.db'
+            old = sqlite3.connect(path)
+            old.execute('CREATE TABLE attempts (thread_id TEXT NOT NULL, failed_turn_id TEXT NOT NULL, '
+                        'claimed_at TEXT NOT NULL, state TEXT NOT NULL, created_turn_id TEXT, details TEXT, '
+                        'PRIMARY KEY (thread_id, failed_turn_id))')
+            old.execute("INSERT INTO attempts VALUES ('t','f','2024-01-01','submitted',NULL,NULL)")
+            old.commit()
+            old.close()
+            conn = guardian.db_open(path)
+            try:
+                self.assertIsNone(conn.execute('select title from attempts').fetchone()[0])
+            finally:
+                conn.close()
 
     def test_status_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:

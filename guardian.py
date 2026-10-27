@@ -43,6 +43,11 @@ def db_open(path):
         created_turn_id TEXT, details TEXT,
         PRIMARY KEY (thread_id, failed_turn_id)
     )''')
+    # Older databases predate the snapshot columns; add them without losing history.
+    columns = {row[1] for row in conn.execute('PRAGMA table_info(attempts)')}
+    for name in ('title', 'cwd', 'project', 'project_label'):
+        if name not in columns:
+            conn.execute(f'ALTER TABLE attempts ADD COLUMN {name} TEXT')
     conn.commit()
     return conn
 
@@ -51,11 +56,12 @@ def get_attempt(conn, tid, turn):
     return conn.execute('SELECT state FROM attempts WHERE thread_id=? AND failed_turn_id=?', (tid, turn)).fetchone()
 
 
-def claim(conn, tid, turn):
+def claim(conn, tid, turn, title=None, cwd=None, project=None, project_label=None):
     try:
         with conn:
-            conn.execute('INSERT INTO attempts (thread_id, failed_turn_id, claimed_at, state) VALUES (?,?,?,?)',
-                         (tid, turn, utcnow(), 'submit_unknown'))
+            conn.execute('INSERT INTO attempts (thread_id, failed_turn_id, claimed_at, state, title, cwd, '
+                         'project, project_label) VALUES (?,?,?,?,?,?,?,?)',
+                         (tid, turn, utcnow(), 'submit_unknown', title, cwd, project, project_label))
         return True
     except sqlite3.IntegrityError:
         return False
@@ -261,6 +267,31 @@ def match_project(cwd, cfg):
     return best is not None, best
 
 
+def infer_project(cwd):
+    """Best-effort project root: nearest git repo below home, else the directory itself."""
+    if not cwd:
+        return None
+    try:
+        path = Path(norm_path(cwd))
+        home = Path(norm_path(str(HOME)))
+    except Exception:
+        return None
+    for parent in (path, *path.parents):
+        # Never mistake a dotfiles repo at ~ for the project.
+        if parent != home and (parent / '.git').exists():
+            return str(parent)
+        if parent == home:
+            break
+    return str(path)
+
+
+def project_of(cwd, cfg):
+    """(monitored, project entry, project path) with inference for unconfigured dirs."""
+    tracked, project = match_project(cwd, cfg)
+    path = project['path'] if project else infer_project(cwd)
+    return tracked, project, path
+
+
 def write_status(path, stats):
     path = Path(path)
     tmp = path.with_name(path.name + '.tmp')
@@ -337,10 +368,22 @@ def run_scan(server, conn, send, config=None, status_path=None, interval=None, s
 def _run_scan(server, conn, send, cfg, stats):
     eligible, unmonitored = [], []
     total = errors = duplicates = 0
+    # Backfill snapshot fields for attempts recorded before those columns existed.
+    pending = {row[0] for row in conn.execute(
+        "SELECT DISTINCT thread_id FROM attempts WHERE title IS NULL OR title='' "
+        "OR cwd IS NULL OR cwd='' OR project IS NULL OR project=''")}
+    found = {}
     # First collect all candidates (first boot and every scan); do not use 'updatedAt > installation_time'.
     for t in all_threads(server):
         total += 1
         tid, status = t['id'], thread_status(t)
+        if tid in pending:
+            title = t.get('name') or t.get('title') or ''
+            cwd = t.get('cwd')
+            _, project, project_path = project_of(cwd, cfg)
+            if title or cwd:
+                found[tid] = (title, cwd, project_path,
+                              (project.get('label') or '') if project else '')
         if status not in ('idle', 'systemError', 'notLoaded'):
             continue
         try:
@@ -357,15 +400,26 @@ def _run_scan(server, conn, send, cfg, stats):
             log.info('SKIP duplicate %s / %s', tid, failed_turn)
             continue
         cwd = t.get('cwd')
-        tracked, project = match_project(cwd, cfg)
+        tracked, project, project_path = project_of(cwd, cfg)
         entry = {'thread_id': tid,
                  'failed_turn_id': failed_turn,
                  'cwd': cwd,
                  'title': t.get('name') or t.get('title') or '',
                  'status': status,
-                 'project': project['path'] if project else None,
+                 'project': project_path,
                  'project_label': (project.get('label') or '') if project else ''}
         (eligible if tracked else unmonitored).append(entry)
+    if found:
+        with conn:
+            conn.executemany(
+                "UPDATE attempts SET "
+                "title=COALESCE(NULLIF(title,''), ?), "
+                "cwd=COALESCE(NULLIF(cwd,''), ?), "
+                "project=COALESCE(NULLIF(project,''), ?), "
+                "project_label=COALESCE(NULLIF(project_label,''), ?) "
+                "WHERE thread_id=?",
+                [(title, cwd, project, label, tid)
+                 for tid, (title, cwd, project, label) in found.items()])
     stats['scan'].update(threads=total, candidates=len(eligible), unmonitored=len(unmonitored),
                          errors=errors, duplicates=duplicates)
     stats['eligible'] = eligible
@@ -432,7 +486,8 @@ def _run_scan(server, conn, send, cfg, stats):
                     log.info('SKIP %s changed after thread/resume', tid)
                     continue
             # Persist an at-most-once claim BEFORE sending. On timeouts, never re-send blindly.
-            if not claim(conn, tid, failed):
+            if not claim(conn, tid, failed, e.get('title'), e.get('cwd'),
+                         e.get('project'), e.get('project_label')):
                 continue
             try:
                 result = server.call('turn/start', {
