@@ -12,9 +12,21 @@ class FakeServer:
         self.fail_after_first = False
         self.last_turns = {}
         self.starts = 0
+        self.reconnects = 0
+        self.reconnect_error = False
+        self.transport_fail = {}
+
+    def reconnect(self):
+        self.reconnects += 1
+        if self.reconnect_error:
+            raise guardian.TransportError('simulated reconnect failure')
 
     def call(self, method, params=None):
         self.requests.append((method,params))
+        remaining = self.transport_fail.get(method)
+        if remaining:
+            self.transport_fail[method] = remaining - 1
+            raise guardian.TransportError('simulated transport failure: ' + method)
         if method == 'thread/list':
             ids = list(self.threads)
             page = int((params or {}).get('cursor') or '0')
@@ -134,6 +146,38 @@ class GuardianTests(unittest.TestCase):
             self.assertEqual(guardian.load_config(tmp)['projects'][0]['path'],'/repo/a')
             (Path(tmp) / guardian.CONFIG_NAME).write_text('{not json')
             self.assertEqual(guardian.load_config(tmp)['projects'],[])
+
+    def test_transport_error_reconnects_and_continues(self):
+        s = FakeServer([t('a',failed('fa')),t('b',failed('fb'))])
+        s.transport_fail = {'thread/read':1}
+        guardian.run_scan(s,self.db,True)
+        self.assertEqual(s.reconnects,1)
+        self.assertEqual(s.starts,1)
+        self.assertEqual([r[0] for r in self.db.execute('select thread_id from attempts')],['b'])
+
+    def test_transport_error_after_claim_is_unknown_and_never_retried(self):
+        s = FakeServer([t('a',failed('fa')),t('b',failed('fb'))])
+        s.transport_fail = {'turn/start':1}
+        guardian.run_scan(s,self.db,True)
+        self.assertEqual(s.reconnects,1)
+        self.assertEqual(s.starts,1)
+        states = dict(self.db.execute('select thread_id,state from attempts'))
+        self.assertEqual(states,{'a':'unknown','b':'submitted'})
+        guardian.run_scan(s,self.db,True)
+        self.assertEqual(s.starts,1)
+
+    def test_reconnect_failure_defers_remaining_candidates(self):
+        s = FakeServer([t('a',failed('fa')),t('b',failed('fb'))])
+        s.transport_fail = {'thread/read':1}
+        s.reconnect_error = True
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / guardian.STATUS_NAME
+            guardian.run_scan(s,self.db,True,status_path=path)
+            st = json.loads(path.read_text())
+        self.assertEqual(st['waiting'],'transport_error')
+        self.assertEqual(st['scan']['reconnects'],1)
+        self.assertEqual(s.starts,0)
+        self.assertIn('reconnect failed',st['last_error'])
 
 if __name__=='__main__':
     unittest.main()

@@ -5,7 +5,7 @@ Guardian：通过已有的 Codex App Server Unix socket 扫描历史 thread，�
 ## 常用命令
 
 ```bash
-python3 -m unittest test_guardian test_web test_macos -v   # 全部测试（不需要真实 socket / Codex）
+python3 -m unittest test_guardian test_web test_transport test_macos -v   # 全部测试（不需要真实 socket / Codex）
 python3 -m unittest test_guardian.GuardianTests.test_not_loaded_resumed_original_id
 python3 -m py_compile guardian.py web.py probe_transport.py install_macos.py
 bash -n install.sh
@@ -28,6 +28,7 @@ python3 web.py --no-live                 # 本地起控制台（127.0.0.1:8787�
 - **扫描必须遍历全部分页**：`thread/list` 的 `nextCursor` 有值就继续；分页异常、cursor 重复直接抛错放弃本轮，不允许截断或部分处理后再继续。
 - 候选判定严格：最新 turn 为 `failed` 且 `error.codexErrorInfo == 'usageLimitExceeded'`，并且 `account/rateLimits/read` 的 `ordinaryUsageAllowed is True`（其他值一律等待）。
 - `notLoaded` 的 thread 用 `thread/resume` 加载后**沿用原 thread ID**，不 fork。
+- **传输异常必须丢弃连接**：`probe_transport.TransportError` 表示连接已不可复用（大帧、close、超时、JSON 错乱）。dispatch 阶段在 claim 之前出错时，重连后继续下一个候选；claim 之后出错只记 `unknown`，**绝不重试**。`Server.reconnect()` 重建连接；重连失败则中止本轮。帧上限 64 MiB，且 `Client.take()` 必须线性拼接（不要 `buf += chunk`）。
 - 状态与仓库、安装目录解耦：`~/.local/state/codex-auto-resume-all/`（`CODEX_GUARDIAN_HOME` 可覆盖），内含 `attempts.sqlite3`、`config.json`、`status.json` 和 `lock`。daemon 在跑时再启动一个非 `--status` 实例会因 flock 直接退出（`Another guardian instance is running`），这不是 bug。
 - README 的"安全约束"章节仍是有效约束（并行会话可能改同一目录、无法保证 exactly-once 等），改行为时同步更新。
 
@@ -46,6 +47,7 @@ python3 web.py --no-live                 # 本地起控制台（127.0.0.1:8787�
 - `FakeServer.call()` 按方法名硬编码。新增/修改 RPC 调用时要在 `FakeServer` 里同步实现，否则测试抛 `Unexpected method`。
 - 测试会断言 `starts` 次数和 attempts 表行数，改判定/去重逻辑时优先扩展这些用例。
 - `test_macos.py` 只验证 plist 生成（`plistlib` 解析、绝对路径、参数、Umask），**不调用 `launchctl`**，所以在 Linux 上也能跑。不要去真实 `bootout` 别人的 LaunchAgent。
+- `test_transport.py` 用 FakeSock 离线验证 unmask、分块读取和大帧上限，不需要真实 socket。
 
 ## macOS 支持
 

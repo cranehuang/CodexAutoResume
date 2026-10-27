@@ -19,14 +19,31 @@ import time
 from pathlib import Path
 
 GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+# The server may push a large notification while we wait for a response.
+# 64 MiB keeps headroom over the old 16 MiB cap without unbounded allocation.
+MAX_FRAME_BYTES = 64 * 1024 * 1024
+
+
+class TransportError(RuntimeError):
+    """Socket/protocol failure; the connection must not be reused."""
+
+
+def unmask(payload, mask):
+    """XOR a WebSocket payload with its 4-byte mask (C-speed via big ints)."""
+    if not payload:
+        return payload
+    n = len(payload)
+    key = (mask * (n // 4 + 1))[:n]
+    return (int.from_bytes(payload, 'big') ^ int.from_bytes(key, 'big')).to_bytes(n, 'big')
+
 
 def check_socket_path(path):
     """macOS caps sun_path at 104 bytes (Linux 108); fail with a readable error."""
     limit = 104 if sys.platform == 'darwin' else 108
     size = len(os.fsencode(path))
     if size >= limit:
-        raise RuntimeError(f'Unix socket path is too long for this platform '
-                           f'({size} >= {limit} bytes): {path}')
+        raise TransportError(f'Unix socket path is too long for this platform '
+                             f'({size} >= {limit} bytes): {path}')
 
 class Client:
     def __init__(self, path, timeout=7):
@@ -43,30 +60,38 @@ class Client:
         while b'\r\n\r\n' not in self.buf:
             chunk = self.sock.recv(8192)
             if not chunk:
-                raise RuntimeError('Socket closed during WebSocket handshake')
+                raise TransportError('Socket closed during WebSocket handshake')
             self.buf += chunk
             if len(self.buf) > 65536:
-                raise RuntimeError('Oversized WebSocket handshake')
+                raise TransportError('Oversized WebSocket handshake')
         head, self.buf = self.buf.split(b'\r\n\r\n', 1)
         lines = head.decode('iso-8859-1').split('\r\n')
         if not lines[0].startswith('HTTP/1.1 101 '):
-            raise RuntimeError(f'WebSocket upgrade rejected: {lines[0]}')
+            raise TransportError(f'WebSocket upgrade rejected: {lines[0]}')
         headers = dict(line.split(':', 1) for line in lines[1:] if ':' in line)
         headers = {k.lower():v.strip() for k,v in headers.items()}
         expected = base64.b64encode(hashlib.sha1((key + GUID).encode('ascii')).digest()).decode('ascii')
         if headers.get('sec-websocket-accept') != expected:
-            raise RuntimeError('WebSocket accept key mismatch')
+            raise TransportError('WebSocket accept key mismatch')
 
     def close(self):
         self.sock.close()
 
     def take(self, n):
-        while len(self.buf) < n:
-            chunk = self.sock.recv(8192)
+        if len(self.buf) >= n:
+            out, self.buf = self.buf[:n], self.buf[n:]
+            return out
+        # Accumulate chunks then join once: `buf += chunk` is O(n^2) on large frames.
+        chunks = [self.buf]
+        have = len(self.buf)
+        while have < n:
+            chunk = self.sock.recv(262144)
             if not chunk:
-                raise RuntimeError('Server closed WebSocket unexpectedly')
-            self.buf += chunk
-        out, self.buf = self.buf[:n], self.buf[n:]
+                raise TransportError('Server closed WebSocket unexpectedly')
+            chunks.append(chunk)
+            have += len(chunk)
+        data = b''.join(chunks)
+        out, self.buf = data[:n], data[n:]
         return out
 
     def send_frame(self, opcode, payload=b''):
@@ -94,14 +119,14 @@ class Client:
                 n = struct.unpack('!H', self.take(2))[0]
             elif n == 127:
                 n = struct.unpack('!Q', self.take(8))[0]
-            if n > 16 * 1024 * 1024:
-                raise RuntimeError('Frame is unexpectedly large')
+            if n > MAX_FRAME_BYTES:
+                raise TransportError(f'Frame is unexpectedly large: {n} bytes')
             mask = self.take(4) if masked else None
             payload = self.take(n)
             if mask:
-                payload = bytes(v ^ mask[i % 4] for i, v in enumerate(payload))
+                payload = unmask(payload, mask)
             if opcode == 0x8:
-                raise RuntimeError('Server sent WebSocket close')
+                raise TransportError('Server sent WebSocket close')
             if opcode == 0x9:
                 self.send_frame(0xA, payload)
                 continue
@@ -117,15 +142,23 @@ class Client:
         obj = {'id':request_id, 'method':method}
         if params is not None:
             obj['params'] = params
-        self.send_frame(1, json.dumps(obj, ensure_ascii=False, separators=(',', ':')))
-        deadline = time.monotonic() + 12
-        while time.monotonic() < deadline:
-            msg = json.loads(self.receive_message())
-            if msg.get('id') == request_id:
-                if 'error' in msg:
-                    raise RuntimeError(f'{method}: {msg["error"]}')
-                return msg.get('result', {})
-        raise TimeoutError(f'{method} timed out')
+        try:
+            self.send_frame(1, json.dumps(obj, ensure_ascii=False, separators=(',', ':')))
+            deadline = time.monotonic() + 12
+            while time.monotonic() < deadline:
+                try:
+                    msg = json.loads(self.receive_message())
+                except json.JSONDecodeError as exc:
+                    raise TransportError(f'{method}: invalid JSON from server: {exc}') from exc
+                if msg.get('id') == request_id:
+                    if 'error' in msg:
+                        raise RuntimeError(f'{method}: {msg["error"]}')
+                    return msg.get('result', {})
+            raise TransportError(f'{method} timed out')
+        except TransportError:
+            raise
+        except (OSError, TimeoutError) as exc:
+            raise TransportError(f'{method}: {exc}') from exc
 
     def initialized(self):
         self.send_frame(1, '{"method":"initialized","params":{}}')

@@ -12,6 +12,7 @@ const WAITING = {
   dispatching: ['发送中', 'info'],
   sent: ['本轮已处理', 'ok'],
   scan_failed: ['扫描失败', 'bad'],
+  transport_error: ['传输异常，等待下一轮', 'bad'],
 };
 
 const ATTEMPT_STATE = {
@@ -127,6 +128,7 @@ function renderScan() {
     ['未监控', scan.unmonitored ?? '—'],
     ['本轮耗时', scan.duration_ms == null ? '—' : `${(scan.duration_ms / 1000).toFixed(1)}s`],
     ['已提交去重', scan.duplicates ?? '—'],
+    ['重连', scan.reconnects ?? '—'],
     ['错误', scan.errors ?? '—'],
   ]);
 }

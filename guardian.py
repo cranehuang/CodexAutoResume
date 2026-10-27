@@ -16,7 +16,7 @@ import sqlite3
 import sys
 import time
 
-from probe_transport import Client
+from probe_transport import Client, TransportError
 
 HOME = Path.home()
 STATE_DIR = Path(os.environ.get('CODEX_GUARDIAN_HOME', str(HOME / '.local/state/codex-auto-resume-all')))
@@ -68,19 +68,49 @@ def set_state(conn, tid, failed_turn, state, new_turn=None, details=None):
 
 
 class Server:
+    CLIENT_INFO = {'name':'codex_auto_resume_all',
+                   'title':'Codex automatic all-thread recovery', 'version':'1.0.0'}
+
     def __init__(self, sock):
-        self.client = Client(sock, timeout=14)
+        self.sock = sock
+        self.client = None
         self.n = 0
-        self.call('initialize', {'clientInfo':{'name':'codex_auto_resume_all',
-                                              'title':'Codex automatic all-thread recovery', 'version':'1.0.0'}})
-        self.client.initialized()
+        self._connect()
+
+    def _connect(self):
+        client = Client(self.sock, timeout=14)
+        self.client = client
+        try:
+            self.call('initialize', {'clientInfo': self.CLIENT_INFO})
+            client.initialized()
+        except Exception:
+            try:
+                client.close()
+            except Exception:
+                pass
+            self.client = None
+            raise
+
+    def reconnect(self):
+        """Replace a poisoned connection; callers keep the same Server object."""
+        if self.client is not None:
+            try:
+                self.client.close()
+            except Exception:
+                pass
+        self.client = None
+        self._connect()
 
     def call(self, name, params=None):
+        if self.client is None:
+            raise TransportError('Not connected')
         self.n += 1
         return self.client.rpc(self.n, name, params)
 
     def close(self):
-        self.client.close()
+        if self.client is not None:
+            self.client.close()
+            self.client = None
 
 
 def all_threads(server):
@@ -280,7 +310,7 @@ def run_scan(server, conn, send, config=None, status_path=None, interval=None, s
         'socket_ok': True,
         'monitor_all': not active,
         'scan': {'threads': 0, 'candidates': 0, 'unmonitored': 0,
-                 'errors': 0, 'duplicates': 0, 'duration_ms': None},
+                 'errors': 0, 'duplicates': 0, 'reconnects': 0, 'duration_ms': None},
         'quota': None,
         'eligible': [],
         'unmonitored': [],
@@ -378,6 +408,7 @@ def _run_scan(server, conn, send, cfg, stats):
     submitted = stats['submitted']
     for e in eligible:
         tid, failed = e['thread_id'], e['failed_turn_id']
+        reconnect = False
         try:
             ok, lim = available(server)
             stats['quota'] = quota_dict(lim)
@@ -418,15 +449,38 @@ def _run_scan(server, conn, send, cfg, stats):
                     set_state(conn, tid, failed, 'submitted', new_turn=new_turn)
                     submitted.append({'thread_id': tid, 'failed_turn_id': failed, 'new_turn_id': new_turn})
                     log.info('SUBMITTED thread=%s old=%s new=%s', tid, failed, new_turn)
+            except TransportError as exc:
+                # Claim already exists: record unknown, never retry, but drop the connection.
+                set_state(conn, tid, failed, 'unknown', details=f'transport: {exc}')
+                log.error('UNKNOWN submission %s (transport, no automatic retry): %s', tid, exc)
+                stats['last_error'] = f'unknown submission for {tid}: {exc}'
+                reconnect = True
             except Exception as exc:
                 set_state(conn, tid, failed, 'unknown', details=str(exc))
                 log.error('UNKNOWN submission %s (no automatic retry): %s', tid, exc)
                 stats['last_error'] = f'unknown submission for {tid}: {exc}'
+        except TransportError as exc:
+            # Nothing claimed for this candidate: safe to reconnect and continue with the next one.
+            errors += 1
+            stats['scan']['errors'] = errors
+            reconnect = True
+            log.error('TRANSPORT candidate %s failed: %s', tid, exc)
         except Exception as exc:
             errors += 1
             stats['scan']['errors'] = errors
             log.error('SKIP candidate %s: %s', tid, exc)
-    log.info('SCAN COMPLETE submitted=%d', len(submitted))
+        if reconnect:
+            stats['scan']['reconnects'] += 1
+            try:
+                server.reconnect()
+                log.info('RECONNECTED after transport error; continuing with next candidate')
+            except Exception as exc:
+                log.error('RECONNECT failed, deferring remaining candidates: %s', exc)
+                stats['waiting'] = 'transport_error'
+                stats['last_error'] = f'reconnect failed: {exc}'
+                break
+    log.info('SCAN COMPLETE submitted=%d reconnects=%d',
+             len(submitted), stats['scan']['reconnects'])
 
 
 def main():
