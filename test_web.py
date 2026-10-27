@@ -37,8 +37,10 @@ class WebConsoleTests(unittest.TestCase):
 
         conn = guardian.db_open(self.root / 'attempts.sqlite3')
         with conn:
-            conn.execute('INSERT INTO attempts (thread_id, failed_turn_id, claimed_at, state, created_turn_id) '
-                         'VALUES (?,?,?,?,?)', ('t-1', 'f-1', guardian.utcnow(), 'submitted', 'n-1'))
+            conn.execute('INSERT INTO attempts (thread_id, failed_turn_id, claimed_at, state, created_turn_id, '
+                         'title, cwd, project, project_label) VALUES (?,?,?,?,?,?,?,?,?)',
+                         ('t-1', 'f-1', guardian.utcnow(), 'submitted', 'n-1', '示例会话',
+                          '/repo/a', '/repo/a', '项目 A'))
         conn.close()
 
         self.console = web.Console(self.root, Path(__file__).resolve().parent / 'webui',
@@ -77,6 +79,9 @@ class WebConsoleTests(unittest.TestCase):
         self.assertEqual(data['status']['scan']['threads'], 3)
         self.assertEqual(data['attempts']['counts']['submitted'], 1)
         self.assertEqual(data['attempts']['recent'][0]['thread_id'], 't-1')
+        self.assertEqual(data['attempts']['recent'][0]['title'], '示例会话')
+        self.assertEqual(data['attempts']['recent'][0]['project_label'], '项目 A')
+        self.assertEqual(data['attempts']['recent'][0]['cwd'], '/repo/a')
         self.assertEqual(data['config']['projects'], [])
 
     def test_static_index_and_traversal(self):

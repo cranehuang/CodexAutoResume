@@ -88,10 +88,13 @@ class Console:
             result['last_24h'] = conn.execute(
                 'SELECT COUNT(*) FROM attempts WHERE claimed_at >= ?', (cutoff,)).fetchone()[0]
             rows = conn.execute(
-                'SELECT thread_id, failed_turn_id, claimed_at, state, created_turn_id, details '
+                'SELECT thread_id, failed_turn_id, claimed_at, state, created_turn_id, details, title, '
+                'cwd, project, project_label '
                 'FROM attempts ORDER BY claimed_at DESC LIMIT ?', (limit,)).fetchall()
             result['recent'] = [{'thread_id': r[0], 'failed_turn_id': r[1], 'claimed_at': r[2],
-                                 'state': r[3], 'created_turn_id': r[4], 'details': r[5]}
+                                 'state': r[3], 'created_turn_id': r[4], 'details': r[5],
+                                 'title': r[6] or '', 'cwd': r[7] or '',
+                                 'project': r[8] or '', 'project_label': r[9] or ''}
                                 for r in rows]
         finally:
             conn.close()
