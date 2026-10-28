@@ -42,7 +42,7 @@ flowchart LR
     CHECK{"Latest turn failed with<br/>usageLimitExceeded?"}
     QUOTA{"ordinaryUsageAllowed?"}
     CLAIM["claim()<br/>before sending"]
-    RESUME["thread/resume if notLoaded<br/>turn/start '继续'"]
+    RESUME["thread/resume if notLoaded<br/>turn/start same-language prompt"]
   end
 
   subgraph StateSide["state dir<br/>~/.local/state/codex-auto-resume-all"]
@@ -86,7 +86,8 @@ Runtime pieces:
 
 Scan flow per round: read `config.json` → walk all thread pages → keep `usageLimitExceeded`
 failures not seen before → read `account/rateLimits/read` → claim each candidate in SQLite
-→ `thread/resume` if needed → `turn/start` with `继续` → record `submitted` / `unknown`.
+→ `thread/resume` if needed → `turn/start` with a prompt in the language of the user's
+last message → record `submitted` / `unknown`.
 
 ## Install
 
@@ -102,7 +103,7 @@ Optional manual check first:
 python3 -m py_compile guardian.py probe_transport.py web.py install_macos.py
 python3 guardian.py         # first read-only scan, including historical failures
 python3 guardian.py --status
-python3 guardian.py --send  # WARNING: really sends "继续" to every eligible original thread
+python3 guardian.py --send  # WARNING: really sends the continuation prompt to every eligible thread
 ```
 
 Install as a resident service once you are happy:

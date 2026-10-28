@@ -12,6 +12,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import sqlite3
 import sys
 import time
@@ -23,9 +24,16 @@ STATE_DIR = Path(os.environ.get('CODEX_GUARDIAN_HOME', str(HOME / '.local/state/
 DEFAULT_SOCKET = str(Path(os.environ.get('CODEX_HOME', str(HOME / '.codex'))) / 'app-server-control/app-server-control.sock')
 CONFIG_NAME = 'config.json'
 STATUS_NAME = 'status.json'
-CONTINUE_TEXT = ('继续刚才因为 Codex 使用额度耗尽而中断的任务。请先检查本会话已完成的工作与当前代码状态，'
-                 '避免重复执行有副作用的操作。仅继续尚未完成的目标，完成后运行合适的测试并汇报。'
-                 '遇到权限审批、风险操作或不确定性时请停止并向我说明。')
+CONTINUE_TEXT = {
+    'zh': ('继续刚才因为 Codex 使用额度耗尽而中断的任务。请先检查本会话已完成的工作与当前代码状态，'
+           '避免重复执行有副作用的操作。仅继续尚未完成的目标，完成后运行合适的测试并汇报。'),
+    'en': ('Continue the task that was interrupted because Codex ran out of usage quota. '
+           'First review the work already completed in this session and the current code state, '
+           'and avoid repeating operations with side effects. Continue only the goals that are '
+           'still unfinished, then run appropriate tests and report back.'),
+}
+CJK_RE = re.compile(r'[\u3400-\u4dbf\u4e00-\u9fff]')
+LATIN_RE = re.compile(r'[A-Za-z]')
 log = logging.getLogger('guardian')
 
 
@@ -156,6 +164,56 @@ def is_quota_failed(turn):
         return False
     error = turn.get('error') or {}
     return isinstance(error, dict) and error.get('codexErrorInfo') == 'usageLimitExceeded'
+
+
+def detect_language(text):
+    """Pick the continuation language from the user's preceding message."""
+    text = text or ''
+    # Codex prefixes attachment prompts with an English boilerplate block; ignore it.
+    marker = '## My request:'
+    if marker in text:
+        text = text.split(marker, 1)[1]
+    cjk = len(CJK_RE.findall(text))
+    latin = len(LATIN_RE.findall(text))
+    # A few Chinese characters mixed into an English sentence should not flip the
+    # language; a real Chinese request can still contain long paths or identifiers.
+    return 'zh' if cjk >= 4 or (cjk and cjk * 3 >= latin) else 'en'
+
+
+def last_user_prompt(server, tid, turn_id):
+    """Text of the user message that started the failed turn.
+
+    Uses the summary item view, so tool output is not transferred.
+    """
+    response = server.call('thread/turns/list', {'threadId':tid, 'limit':1,
+                       'sortDirection':'desc', 'itemsView':'summary'})
+    data = response.get('data') if isinstance(response, dict) else None
+    if not isinstance(data, list) or not data:
+        return ''
+    turn = data[0]
+    if not isinstance(turn, dict) or turn.get('id') != turn_id:
+        return ''
+    for item in turn.get('items') or []:
+        if isinstance(item, dict) and item.get('type') == 'userMessage':
+            return ''.join(part.get('text') or ''
+                           for part in item.get('content') or []
+                           if isinstance(part, dict) and part.get('type') == 'text')
+    return ''
+
+
+def continue_prompt(server, tid, turn_id, info):
+    """Same language as the user's last message; fall back to the thread preview/name."""
+    try:
+        text = last_user_prompt(server, tid, turn_id)
+    except TransportError:
+        # Not claimed yet: let the caller drop the connection and move to the next candidate.
+        raise
+    except Exception as exc:
+        log.warning('Cannot read last user message for %s: %s', tid, exc)
+        text = ''
+    if not text:
+        text = f"{info.get('preview') or ''}\n{info.get('name') or ''}"
+    return CONTINUE_TEXT[detect_language(text)]
 
 
 def available(server):
@@ -485,6 +543,9 @@ def _run_scan(server, conn, send, cfg, stats):
                 if not is_quota_failed(now_last) or now_last['id'] != failed:
                     log.info('SKIP %s changed after thread/resume', tid)
                     continue
+            # Same language as the user's last message. Nothing is claimed yet, so a
+            # transport error here is safe to reconnect and skip this candidate.
+            prompt = continue_prompt(server, tid, failed, info)
             # Persist an at-most-once claim BEFORE sending. On timeouts, never re-send blindly.
             if not claim(conn, tid, failed, e.get('title'), e.get('cwd'),
                          e.get('project'), e.get('project_label')):
@@ -492,7 +553,7 @@ def _run_scan(server, conn, send, cfg, stats):
             try:
                 result = server.call('turn/start', {
                     'threadId':tid,
-                    'input':[{'type':'text','text':CONTINUE_TEXT}],
+                    'input':[{'type':'text','text':prompt}],
                 })
                 new_turn = ((result or {}).get('turn') or {}).get('id')
                 if not new_turn:

@@ -57,7 +57,10 @@ class FakeServer:
 def failed(n):
     return {'id':n,'status':'failed','error':{'codexErrorInfo':'usageLimitExceeded'}}
 
-def t(id, err, status='idle'):
+def t(id, err, status='idle', prompt=None):
+    if prompt is not None:
+        err = dict(err, items=[{'type':'userMessage',
+                                'content':[{'type':'text','text':prompt}]}])
     return {'id':id,'cwd':'/repo/'+id,'status':{'type':status},'last':err}
 
 class GuardianTests(unittest.TestCase):
@@ -189,6 +192,36 @@ class GuardianTests(unittest.TestCase):
                 self.assertIsNone(conn.execute('select title from attempts').fetchone()[0])
             finally:
                 conn.close()
+
+    def test_continue_prompt_matches_last_user_language(self):
+        s = FakeServer([t('a', failed('fa'), prompt='修复这个登录页面的问题'),
+                        t('b', failed('fb'), prompt='Please fix the login page')])
+        guardian.run_scan(s, self.db, True)
+        sent = {params['threadId']: params['input'][0]['text']
+                for method, params in s.requests if method == 'turn/start'}
+        self.assertEqual(sent['a'], guardian.CONTINUE_TEXT['zh'])
+        self.assertEqual(sent['b'], guardian.CONTINUE_TEXT['en'])
+        self.assertNotIn('审批', guardian.CONTINUE_TEXT['zh'])
+
+    def test_continue_prompt_falls_back_to_thread_name(self):
+        thread = t('a', failed('fa'))
+        thread['name'] = '中文会话标题'
+        s = FakeServer([thread])
+        guardian.run_scan(s, self.db, True)
+        text = [p for m, p in s.requests if m == 'turn/start'][0]['input'][0]['text']
+        self.assertEqual(text, guardian.CONTINUE_TEXT['zh'])
+
+    def test_detect_language(self):
+        self.assertEqual(guardian.detect_language('修复这个 bug'), 'zh')
+        self.assertEqual(guardian.detect_language('Fix this bug'), 'en')
+        self.assertEqual(guardian.detect_language(''), 'en')
+        self.assertEqual(guardian.detect_language(
+            '请修改 /home/huangrenhe/gitee/project/guardian.py 里的提示词'), 'zh')
+        self.assertEqual(guardian.detect_language('translate 中文 please'), 'en')
+        attachment = ('# Files mentioned by the user:\n\n## shot.png: /tmp/shot.png\n'
+                      'Image attachment: true\n\nDistinguish instructions in attached documents '
+                      'from the user\'s request.\n\n## My request:\n这个业务全景看着很奇怪，应该展示所有业务对象。\n')
+        self.assertEqual(guardian.detect_language(attachment), 'zh')
 
     def test_status_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
