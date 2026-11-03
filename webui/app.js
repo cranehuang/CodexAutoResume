@@ -8,6 +8,7 @@ const WAITING = {
   idle: ['无候选', 'ok'],
   quota_blocked: ['额度耗尽，等待恢复', 'warn'],
   quota_unknown: ['额度状态未知，等待', 'warn'],
+  capacity_cooldown: ['模型容量不足，等待重试', 'warn'],
   dry_run: ['dry-run：只报告不发送', 'info'],
   dispatching: ['发送中', 'info'],
   sent: ['本轮已处理', 'ok'],
@@ -145,6 +146,7 @@ function renderScan() {
     ['未监控', scan.unmonitored ?? '—'],
     ['本轮耗时', scan.duration_ms == null ? '—' : `${(scan.duration_ms / 1000).toFixed(1)}s`],
     ['已提交去重', scan.duplicates ?? '—'],
+    ['容量冷却', scan.cooldown ?? '—'],
     ['重连', scan.reconnects ?? '—'],
     ['错误', scan.errors ?? '—'],
   ]);

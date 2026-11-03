@@ -26,7 +26,7 @@ python3 web.py --no-live                 # 本地起控制台（127.0.0.1:8787�
 - **at-most-once 是核心语义**：`claim()` 必须在 `turn/start` 之前落库；响应不明确记 `unknown` 且**绝不重发**。不要"顺手"加重试或补偿逻辑。
 - **默认 dry-run**，只有 `--send` 才真实续跑。手工验证、调试都不要随手加 `--send`（会真消费额度并可能让 Codex 自动改代码/执行命令）。
 - **扫描必须遍历全部分页**：`thread/list` 的 `nextCursor` 有值就继续；分页异常、cursor 重复直接抛错放弃本轮，不允许截断或部分处理后再继续。
-- 候选判定严格：最新 turn 为 `failed` 且 `error.codexErrorInfo == 'usageLimitExceeded'`，并且 `account/rateLimits/read` 的 `ordinaryUsageAllowed is True`（其他值一律等待）。
+- 候选判定严格：最新 turn 为 `failed` 且 `error.codexErrorInfo` 为 `usageLimitExceeded` 或 `serverOverloaded`（模型容量不足，文案 "Selected model is at capacity"），并且 `account/rateLimits/read` 的 `ordinaryUsageAllowed is True`（其他值一律等待）。`serverOverloaded` 失败在同一 thread 上受 `CAPACITY_RETRY_COOLDOWN_SEC`（默认 300s）冷却，避免容量长时间不足时每轮都往会话里注入「继续」。
 - `notLoaded` 的 thread 用 `thread/resume` 加载后**沿用原 thread ID**，不 fork。
 - **传输异常必须丢弃连接**：`probe_transport.TransportError` 表示连接已不可复用（大帧、close、超时、JSON 错乱）。dispatch 阶段在 claim 之前出错时，重连后继续下一个候选；claim 之后出错只记 `unknown`，**绝不重试**。`Server.reconnect()` 重建连接；重连失败则中止本轮。帧上限 64 MiB，且 `Client.take()` 必须线性拼接（不要 `buf += chunk`）。
 - 状态与仓库、安装目录解耦：`~/.local/state/codex-auto-resume-all/`（`CODEX_GUARDIAN_HOME` 可覆盖），内含 `attempts.sqlite3`、`config.json`、`status.json` 和 `lock`。daemon 在跑时再启动一个非 `--status` 实例会因 flock 直接退出（`Another guardian instance is running`），这不是 bug。

@@ -3,7 +3,8 @@
 English | [简体中文](README.zh-CN.md)
 
 Automatically resumes the **original** Codex threads that stopped because the account hit
-its usage limit, as soon as quota is available again.
+its usage limit or the selected model was temporarily at capacity, as soon as the transient
+condition clears.
 
 It works against an existing Codex CLI `0.161.0` App Server
 (`~/.codex/app-server-control/app-server-control.sock`). It never starts a second App
@@ -11,10 +12,12 @@ Server and never forks or re-keys a thread: the continuation is sent to the same
 
 - **Every scan walks all `thread/list` pages**, so quota failures that happened before the
   first boot are picked up too.
-- Only threads whose **latest turn is `failed`** with
-  `error.codexErrorInfo == 'usageLimitExceeded'` are considered.
+- Only threads whose **latest turn is `failed`** with `error.codexErrorInfo` equal to
+  `usageLimitExceeded` (quota) or `serverOverloaded` (model at capacity) are considered.
 - Sending requires `ordinaryUsageAllowed is True`; any other value waits. When quota is
-  back, every eligible thread is resumed by default — there is no per-thread cap.
+  back, every eligible thread is resumed by default — there is no per-thread cap. Capacity
+  failures are retried at most once per thread every `CAPACITY_RETRY_COOLDOWN_SEC` (300s)
+  so a long capacity outage does not keep injecting continuation prompts.
 - SQLite deduplicates by `(thread ID, failed turn ID)`. The claim row is written **before**
   `turn/start`; ambiguous results are recorded as `unknown` and never re-sent. A later,
   different failed turn counts as a new recovery event.
@@ -39,7 +42,7 @@ flowchart LR
 
   subgraph GuardianSide["guardian.py --daemon --send"]
     SCAN["Scan all pages<br/>thread/list"]
-    CHECK{"Latest turn failed with<br/>usageLimitExceeded?"}
+    CHECK{"Latest turn failed with<br/>usageLimitExceeded /<br/>serverOverloaded?"}
     QUOTA{"ordinaryUsageAllowed?"}
     CLAIM["claim()<br/>before sending"]
     RESUME["thread/resume if notLoaded<br/>turn/start same-language prompt"]
@@ -84,10 +87,10 @@ Runtime pieces:
 | `status.json` | Last scan snapshot, atomically rewritten each round |
 | `config.json` | Project allow-list, written by the web console and re-read every scan |
 
-Scan flow per round: read `config.json` → walk all thread pages → keep `usageLimitExceeded`
-failures not seen before → read `account/rateLimits/read` → claim each candidate in SQLite
-→ `thread/resume` if needed → `turn/start` with a prompt in the language of the user's
-last message → record `submitted` / `unknown`.
+Scan flow per round: read `config.json` → walk all thread pages → keep resumable failures
+(`usageLimitExceeded` / `serverOverloaded`) not seen before → read `account/rateLimits/read`
+→ claim each candidate in SQLite → `thread/resume` if needed → `turn/start` with a prompt in
+the language of the user's last message → record `submitted` / `unknown`.
 
 ## Install
 
@@ -180,7 +183,8 @@ The page shows:
 - daemon status, SEND / DRY-RUN mode, last scan time and interval
 - quota: **remaining** percentage and reset time for the 5-hour / weekly windows (same
   framing as Codex `/status`), plus the quota state; live probe cached for 10s by default
-- scan metrics: threads, candidates, unmonitored, duplicates, errors, round duration
+- scan metrics: threads, candidates, unmonitored, duplicates, capacity cooldown, errors,
+  round duration
 - candidate and unmonitored details (thread, cwd, failed turn)
 - submission history (`attempts` table, including `unknown`)
 - **project allow-list** (⚙ menu, top right): add/remove/enable/disable. The guardian

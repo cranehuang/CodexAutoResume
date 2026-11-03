@@ -2,13 +2,13 @@
 
 [English](README.md) | 简体中文
 
-自动把因额度耗尽而中断的 Codex **原会话**在额度恢复后续跑，不新建会话、不更换 Thread ID。
+自动把因额度耗尽或模型容量不足而中断的 Codex **原会话**在条件恢复后续跑，不新建会话、不更换 Thread ID。
 
 适配现有的 Codex CLI `0.161.0` / `~/.codex/app-server-control/app-server-control.sock`，不会另起 App Server。
 
 - **每次扫描都全量遍历 `thread/list` 的所有分页**，纳入之前已发生的额度中断；以后每次扫描也做相同判断。
-- 只检测 **最新 Turn 为 `failed` 且 `error.codexErrorInfo == 'usageLimitExceeded'`** 的会话。
-- `ordinaryUsageAllowed is True` 才发送；其他值全部等待。额度可用后默认恢复所有满足条件的会话，不做单会话上限。
+- 只检测 **最新 Turn 为 `failed` 且 `error.codexErrorInfo` 为 `usageLimitExceeded`（额度耗尽）或 `serverOverloaded`（模型容量不足，文案 “Selected model is at capacity”）** 的会话。
+- `ordinaryUsageAllowed is True` 才发送；其他值全部等待。额度可用后默认恢复所有满足条件的会话，不做单会话上限。`serverOverloaded` 在同一会话上受 `CAPACITY_RETRY_COOLDOWN_SEC`（默认 300s）冷却限制，避免容量长时间不足时每轮都往会话里注入「继续」。
 - 对同一 (Thread ID, failed Turn ID) 使用 SQLite 去重，发送之前记录 claim，结果不确定时标记 `unknown`，不会盲目重发。之后如果又出现新额度失败 Turn，视为新恢复事件。
 - 在发送前重新确认目标状态和最新 Turn，避免人工已经续跑后重复发送。
 - 原会话 `notLoaded` 时使用 `thread/resume` 加载该 Thread；不 fork，不更换 Thread ID。
@@ -26,7 +26,7 @@ flowchart LR
 
   subgraph GuardianSide["guardian.py --daemon --send"]
     SCAN["全量分页扫描<br/>thread/list"]
-    CHECK{"最新 Turn failed 且<br/>usageLimitExceeded?"}
+    CHECK{"最新 Turn failed 且<br/>usageLimitExceeded /<br/>serverOverloaded?"}
     QUOTA{"ordinaryUsageAllowed?"}
     CLAIM["claim()<br/>发送前落库"]
     RESUME["notLoaded 则 thread/resume<br/>turn/start「继续」"]
@@ -70,7 +70,7 @@ flowchart LR
 | `config.json` | 项目白名单，由 Web 控制台写入，守护器每轮重新读取 |
 
 单轮扫描流程：读取 `config.json` → 遍历全部 thread 分页 → 筛出未见过的
-`usageLimitExceeded` 失败 → 调用 `account/rateLimits/read` → 逐条在 SQLite claim →
+`usageLimitExceeded` / `serverOverloaded` 失败 → 调用 `account/rateLimits/read` → 逐条在 SQLite claim →
 必要时 `thread/resume` → `turn/start` 发送「继续」→ 记录 `submitted` / `unknown`。
 
 ## 安装

@@ -54,14 +54,32 @@ class FakeServer:
         raise RuntimeError('Unexpected method: '+method)
 
 
-def failed(n):
-    return {'id':n,'status':'failed','error':{'codexErrorInfo':'usageLimitExceeded'}}
+def failed(n, info='usageLimitExceeded'):
+    return {'id':n,'status':'failed','error':{'codexErrorInfo':info}}
 
 def t(id, err, status='idle', prompt=None):
     if prompt is not None:
         err = dict(err, items=[{'type':'userMessage',
                                 'content':[{'type':'text','text':prompt}]}])
     return {'id':id,'cwd':'/repo/'+id,'status':{'type':status},'last':err}
+
+class ServerTests(unittest.TestCase):
+    def test_initialize_requests_experimental_api(self):
+        created = []
+        class FakeConn:
+            def __init__(self, sock, timeout=None):
+                created.append(self); self.calls = []
+            def rpc(self, n, name, params=None):
+                self.calls.append((name, params)); return {}
+            def initialized(self): pass
+            def close(self): pass
+        with mock.patch.object(guardian, 'Client', FakeConn):
+            guardian.Server('/tmp/does-not-exist.sock')
+        name, params = created[0].calls[0]
+        self.assertEqual(name, 'initialize')
+        self.assertTrue(params['capabilities']['experimentalApi'])
+        self.assertEqual(params['clientInfo']['name'], 'codex_auto_resume_all')
+
 
 class GuardianTests(unittest.TestCase):
     def setUp(self):
@@ -86,6 +104,50 @@ class GuardianTests(unittest.TestCase):
         guardian.run_scan(s,self.db,True)
         self.assertEqual(s.starts,1)
         s.threads['a']['last']=failed('f3')
+        guardian.run_scan(s,self.db,True)
+        self.assertEqual(s.starts,2)
+
+    def test_capacity_failed_turn_is_resumed(self):
+        self.assertEqual(guardian.resume_reason(failed('f','serverOverloaded')), 'capacity')
+        self.assertEqual(guardian.resume_reason(failed('f')), 'quota')
+        self.assertIsNone(guardian.resume_reason(failed('f','contextWindowExceeded')))
+        s = FakeServer([t('a',failed('fa','serverOverloaded'))])
+        guardian.run_scan(s,self.db,True)
+        self.assertEqual(s.starts,1)
+        self.assertEqual(self.db.execute('select state from attempts').fetchone()[0],'submitted')
+
+    def test_capacity_retry_is_throttled_per_thread(self):
+        s = FakeServer([t('a',failed('f1','serverOverloaded'))])
+        guardian.run_scan(s,self.db,True)
+        self.assertEqual(s.starts,1)
+        # The continuation itself failed again because capacity is still exhausted.
+        s.threads['a']['last'] = failed('f2','serverOverloaded')
+        guardian.run_scan(s,self.db,True)
+        self.assertEqual(s.starts,1)
+        # Once the cooldown expires the new failed turn is retried.
+        with self.db:
+            self.db.execute("UPDATE attempts SET claimed_at=? WHERE thread_id='a'",
+                            ('2020-01-01T00:00:00+00:00',))
+        guardian.run_scan(s,self.db,True)
+        self.assertEqual(s.starts,2)
+        self.assertEqual(self.db.execute('select count(*) from attempts').fetchone()[0],2)
+
+    def test_capacity_cooldown_status(self):
+        s = FakeServer([t('a',failed('f1','serverOverloaded'))])
+        guardian.run_scan(s,self.db,True)
+        s.threads['a']['last'] = failed('f2','serverOverloaded')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / guardian.STATUS_NAME
+            guardian.run_scan(s,self.db,True,status_path=path)
+            st = json.loads(path.read_text())
+        self.assertEqual(st['waiting'],'capacity_cooldown')
+        self.assertEqual(st['scan']['cooldown'],1)
+        self.assertEqual(st['scan']['candidates'],0)
+
+    def test_quota_failures_are_not_throttled_by_cooldown(self):
+        s = FakeServer([t('a',failed('f1'))])
+        guardian.run_scan(s,self.db,True)
+        s.threads['a']['last'] = failed('f2')
         guardian.run_scan(s,self.db,True)
         self.assertEqual(s.starts,2)
 

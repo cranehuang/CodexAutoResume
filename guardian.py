@@ -25,13 +25,19 @@ DEFAULT_SOCKET = str(Path(os.environ.get('CODEX_HOME', str(HOME / '.codex'))) / 
 CONFIG_NAME = 'config.json'
 STATUS_NAME = 'status.json'
 CONTINUE_TEXT = {
-    'zh': ('继续刚才因为 Codex 使用额度耗尽而中断的任务。请先检查本会话已完成的工作与当前代码状态，'
+    'zh': ('继续刚才因为 Codex 使用额度耗尽或模型容量不足而中断的任务。请先检查本会话已完成的工作与当前代码状态，'
            '避免重复执行有副作用的操作。仅继续尚未完成的目标，完成后运行合适的测试并汇报。'),
-    'en': ('Continue the task that was interrupted because Codex ran out of usage quota. '
-           'First review the work already completed in this session and the current code state, '
-           'and avoid repeating operations with side effects. Continue only the goals that are '
-           'still unfinished, then run appropriate tests and report back.'),
+    'en': ('Continue the task that was interrupted because Codex ran out of usage quota or the '
+           'selected model was at capacity. First review the work already completed in this session '
+           'and the current code state, and avoid repeating operations with side effects. Continue '
+           'only the goals that are still unfinished, then run appropriate tests and report back.'),
 }
+# Turn failures that are worth resuming once the transient condition clears.
+# Codex maps "Selected model is at capacity. Please try a different model." to serverOverloaded.
+RESUMABLE_ERRORS = {'usageLimitExceeded': 'quota', 'serverOverloaded': 'capacity'}
+# A capacity retry may fail again immediately; throttle per-thread attempts so a long
+# outage does not keep injecting "continue" prompts into the same conversation.
+CAPACITY_RETRY_COOLDOWN_SEC = 300
 CJK_RE = re.compile(r'[\u3400-\u4dbf\u4e00-\u9fff]')
 LATIN_RE = re.compile(r'[A-Za-z]')
 log = logging.getLogger('guardian')
@@ -64,6 +70,21 @@ def get_attempt(conn, tid, turn):
     return conn.execute('SELECT state FROM attempts WHERE thread_id=? AND failed_turn_id=?', (tid, turn)).fetchone()
 
 
+def claimed_within(conn, tid, seconds):
+    """True when this thread's most recent claim is younger than the cooldown."""
+    row = conn.execute('SELECT claimed_at FROM attempts WHERE thread_id=? '
+                       'ORDER BY claimed_at DESC LIMIT 1', (tid,)).fetchone()
+    if not row or not row[0]:
+        return False
+    try:
+        claimed = dt.datetime.fromisoformat(row[0])
+    except (TypeError, ValueError):
+        return False
+    if claimed.tzinfo is None:
+        claimed = claimed.replace(tzinfo=dt.timezone.utc)
+    return (dt.datetime.now(dt.timezone.utc) - claimed).total_seconds() < seconds
+
+
 def claim(conn, tid, turn, title=None, cwd=None, project=None, project_label=None):
     try:
         with conn:
@@ -84,6 +105,8 @@ def set_state(conn, tid, failed_turn, state, new_turn=None, details=None):
 class Server:
     CLIENT_INFO = {'name':'codex_auto_resume_all',
                    'title':'Codex automatic all-thread recovery', 'version':'1.0.0'}
+    # thread/turns/list is gated behind this capability on newer app-server builds.
+    CAPABILITIES = {'experimentalApi': True}
 
     def __init__(self, sock):
         self.sock = sock
@@ -95,7 +118,8 @@ class Server:
         client = Client(self.sock, timeout=14)
         self.client = client
         try:
-            self.call('initialize', {'clientInfo': self.CLIENT_INFO})
+            self.call('initialize', {'clientInfo': self.CLIENT_INFO,
+                                     'capabilities': self.CAPABILITIES})
             client.initialized()
         except Exception:
             try:
@@ -159,11 +183,14 @@ def latest_turn(server, tid):
     return data[0] if data else None
 
 
-def is_quota_failed(turn):
+def resume_reason(turn):
+    """'quota' / 'capacity' when the latest turn is a resumable failure, else None."""
     if not isinstance(turn, dict) or turn.get('status') != 'failed' or not turn.get('id'):
-        return False
+        return None
     error = turn.get('error') or {}
-    return isinstance(error, dict) and error.get('codexErrorInfo') == 'usageLimitExceeded'
+    if not isinstance(error, dict):
+        return None
+    return RESUMABLE_ERRORS.get(error.get('codexErrorInfo'))
 
 
 def detect_language(text):
@@ -399,7 +426,8 @@ def run_scan(server, conn, send, config=None, status_path=None, interval=None, s
         'socket_ok': True,
         'monitor_all': not active,
         'scan': {'threads': 0, 'candidates': 0, 'unmonitored': 0,
-                 'errors': 0, 'duplicates': 0, 'reconnects': 0, 'duration_ms': None},
+                 'errors': 0, 'duplicates': 0, 'cooldown': 0, 'reconnects': 0,
+                 'duration_ms': None},
         'quota': None,
         'eligible': [],
         'unmonitored': [],
@@ -425,7 +453,7 @@ def run_scan(server, conn, send, config=None, status_path=None, interval=None, s
 
 def _run_scan(server, conn, send, cfg, stats):
     eligible, unmonitored = [], []
-    total = errors = duplicates = 0
+    total = errors = duplicates = cooldown = 0
     # Backfill snapshot fields for attempts recorded before those columns existed.
     pending = {row[0] for row in conn.execute(
         "SELECT DISTINCT thread_id FROM attempts WHERE title IS NULL OR title='' "
@@ -450,12 +478,17 @@ def _run_scan(server, conn, send, cfg, stats):
             log.warning('SKIP %s: cannot read last turn: %s', tid, exc)
             errors += 1
             continue
-        if not is_quota_failed(last):
+        reason = resume_reason(last)
+        if reason is None:
             continue
         failed_turn = last['id']
         if get_attempt(conn, tid, failed_turn):
             duplicates += 1
             log.info('SKIP duplicate %s / %s', tid, failed_turn)
+            continue
+        if reason == 'capacity' and claimed_within(conn, tid, CAPACITY_RETRY_COOLDOWN_SEC):
+            cooldown += 1
+            log.info('SKIP %s capacity retry still within cooldown', tid)
             continue
         cwd = t.get('cwd')
         tracked, project, project_path = project_of(cwd, cfg)
@@ -464,6 +497,7 @@ def _run_scan(server, conn, send, cfg, stats):
                  'cwd': cwd,
                  'title': t.get('name') or t.get('title') or '',
                  'status': status,
+                 'reason': reason,
                  'project': project_path,
                  'project_label': (project.get('label') or '') if project else ''}
         (eligible if tracked else unmonitored).append(entry)
@@ -479,11 +513,11 @@ def _run_scan(server, conn, send, cfg, stats):
                 [(title, cwd, project, label, tid)
                  for tid, (title, cwd, project, label) in found.items()])
     stats['scan'].update(threads=total, candidates=len(eligible), unmonitored=len(unmonitored),
-                         errors=errors, duplicates=duplicates)
+                         errors=errors, duplicates=duplicates, cooldown=cooldown)
     stats['eligible'] = eligible
     stats['unmonitored'] = unmonitored
-    log.info('SCAN threads=%d candidates=%d unmonitored=%d duplicates=%d errors=%d',
-             total, len(eligible), len(unmonitored), duplicates, errors)
+    log.info('SCAN threads=%d candidates=%d unmonitored=%d duplicates=%d cooldown=%d errors=%d',
+             total, len(eligible), len(unmonitored), duplicates, cooldown, errors)
 
     quota_ok = False
     try:
@@ -495,7 +529,7 @@ def _run_scan(server, conn, send, cfg, stats):
         log.error('Cannot confirm quota: %s', exc)
 
     if not eligible:
-        stats['waiting'] = 'idle'
+        stats['waiting'] = 'capacity_cooldown' if cooldown else 'idle'
         return
     if stats['quota'] is None:
         stats['waiting'] = 'quota_unknown'
@@ -533,14 +567,14 @@ def _run_scan(server, conn, send, cfg, stats):
                 log.info('SKIP %s now active', tid)
                 continue
             now_last = latest_turn(server, tid)
-            if not is_quota_failed(now_last) or now_last['id'] != failed:
+            if resume_reason(now_last) != e.get('reason') or now_last['id'] != failed:
                 log.info('SKIP %s changed since scan', tid)
                 continue
             if thread_status(info) == 'notLoaded':
                 # Keep the original thread ID; no fork. Loading is a stateful operation.
                 server.call('thread/resume', {'threadId':tid})
                 now_last = latest_turn(server, tid)
-                if not is_quota_failed(now_last) or now_last['id'] != failed:
+                if resume_reason(now_last) != e.get('reason') or now_last['id'] != failed:
                     log.info('SKIP %s changed after thread/resume', tid)
                     continue
             # Same language as the user's last message. Nothing is claimed yet, so a
